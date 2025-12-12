@@ -2,19 +2,25 @@
   "name": "dtrader-4",
   "version": "1.0.0",
   "description": "DTrader-4 Server Application",
-  "main": "src/index.js",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "start": "npm run build && node dist/index.js",
+    "dev": "nodemon --exec ts-node src/index.ts",
+    "build": "tsc",
+    "build:watch": "tsc --watch"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "ws": "^8.14.2",
+    "axios": "^1.13.2",
     "dotenv": "^16.3.1",
-    "ccxt": "^4.2.11"
+    "ws": "^8.14.2"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "@types/dotenv": "^6.1.1",
+    "@types/node": "^25.0.1",
+    "@types/ws": "^8.18.1",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   },
   "author": "Your Name",
   "license": "MIT"
