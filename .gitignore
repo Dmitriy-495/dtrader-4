@@ -1,5 +1,7 @@
 # Node.js
 node_modules/
+dist/
+tests/
 .env
 
 # Logs

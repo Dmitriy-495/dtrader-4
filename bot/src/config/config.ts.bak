@@ -1,0 +1,11 @@
+// Конфигурация для Bot Instance
+import { baseConfig, BaseConfig } from '../config';
+
+export interface BotConfig extends BaseConfig {
+  isShuttingDown: boolean;
+}
+
+export const config: BotConfig = {
+  ...baseConfig,
+  isShuttingDown: false
+};

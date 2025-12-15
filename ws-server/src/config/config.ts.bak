@@ -1,0 +1,10 @@
+// Конфигурация для WebSocket Server Instance
+import { baseConfig, BaseConfig } from '../config';
+
+export interface WsServerConfig extends BaseConfig {
+  // Специфичные настройки для WS сервера
+}
+
+export const config: WsServerConfig = {
+  ...baseConfig
+};

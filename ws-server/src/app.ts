@@ -1,0 +1,874 @@
+// DTrader WebSocket Server Instance - Instance D
+// Трансляция данных клиентам
+
+import { WebSocketServer, WebSocket } from 'ws';
+import { createClient, RedisClientType } from 'redis';
+import dotenv from 'dotenv';
+import { baseConfig as config } from './config/config';
+
+dotenv.config();
+
+interface ClientInfo {
+  id: string;
+  ws: WebSocket;
+  isAlive: boolean;
+  connectedAt: number;
+  subscriptions: {
+    exchanges: Set<string>;
+    events: Set<string>;
+  };
+}
+
+interface SystemStatus {
+  timestamp: number;
+  botStatus: 'idle' | 'running' | 'error';
+  traderStatus: 'idle' | 'running' | 'error';
+  redisConnected: boolean;
+  lastTradeSignal?: string;
+}
+
+class WebSocketServerInstance {
+  private wss?: WebSocketServer;
+  private redisClient: RedisClientType;
+  private clients: Map<string, ClientInfo>;
+  private pingInterval: NodeJS.Timeout | null;
+  private testBroadcastInterval: NodeJS.Timeout | null;
+  private systemStatus: SystemStatus;
+  private exchangeBalance: any | null;
+  private isRunning: boolean;
+  private isShuttingDown: boolean;
+  
+  constructor() {
+    this.isShuttingDown = false;
+    this.testBroadcastInterval = null;
+    this.exchangeBalance = null;
+    this.clients = new Map();
+    this.pingInterval = null;
+    this.isRunning = false;
+    
+    this.systemStatus = {
+      timestamp: Date.now(),
+      botStatus: 'idle',
+      traderStatus: 'idle',
+      redisConnected: false
+    };
+    
+    if (!config.redis) {
+      throw new Error('Redis configuration is required for WebSocket Server');
+    }
+    
+    this.redisClient = createClient({
+      url: `redis://${config.redis.host}:${config.redis.port}`
+    });
+  }
+  
+  async initialize() {
+    try {
+      // Подключаемся к Redis
+      await this.redisClient.connect();
+      this.systemStatus.redisConnected = true;
+      
+      console.log(`✅ [${new Date().toISOString()}] WebSocket Server Instance D инициализирован`);
+      console.log(`   🔌 [${new Date().toISOString()}] Подключено к Redis: redis://${config.redis.host}:${config.redis.port}`);
+      
+      // Создаем WebSocket сервер
+      try {
+        this.wss = new WebSocketServer({ port: config.WS_PORT });
+        console.log(`📡 [${new Date().toISOString()}] WebSocket сервер запущен на ws://localhost:${config.WS_PORT}`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`❌ [${new Date().toISOString()}] Невозможно запустить WebSocket сервер:`, errorMessage);
+        console.error(`   [${new Date().toISOString()}] Порт уже занят или недоступен`);
+        process.exit(1); // Немедленно завершаем процесс
+      }
+      
+      // Настраиваем обработчики
+      this.setupWebSocketHandlers();
+      
+      // Настраиваем ping-pong
+      this.setupPingPong();
+      
+      // Подписываемся на события
+      await this.subscribeToEvents();
+      
+      // ВРЕМЕННО: Периодическая отправка тестового сообщения для проверки вещания
+      this.setupTestBroadcast();
+      
+      this.isRunning = true;
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка инициализации WebSocket Server:`, error);
+      throw error;
+    }
+  }
+  
+  private setupWebSocketHandlers() {
+    if (!this.wss) return;
+    
+    this.wss.on('connection', (ws: WebSocket) => {
+      this.handleNewConnection(ws);
+    });
+    
+    this.wss.on('error', (error: unknown) => {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(`❌ [${new Date().toISOString()}] Ошибка WebSocket сервера:`, errorMessage);
+      if (errorMessage.includes('EADDRINUSE')) {
+        console.error(`💥 [${new Date().toISOString()}] Критическая ошибка: Порт уже занят!`);
+        console.error(`   [${new Date().toISOString()}] Завершаем работу сервера...`);
+        process.exit(1);
+      }
+    });
+  }
+  
+  private handleNewConnection(ws: WebSocket) {
+    try {
+      const clientId = this.generateClientId();
+      
+      const clientInfo: ClientInfo = {
+        id: clientId,
+        ws,
+        isAlive: true,
+        connectedAt: Date.now(),
+        subscriptions: {
+          exchanges: new Set<string>(),
+          events: new Set<string>()
+        }
+      };
+      
+      this.clients.set(clientId, clientInfo);
+      
+      console.log(`🔌 [${new Date().toISOString()}] Новый клиент подключен: ${clientId} (всего: ${this.clients.size})`);
+      
+      // Отправляем приветственное сообщение
+      this.sendWelcomeMessage(ws, clientId);
+      
+      // Отправляем текущий баланс, если он есть
+      if (this.exchangeBalance) {
+        this.sendBalanceToClient(ws, clientId, this.exchangeBalance);
+      }
+      
+      // Отправляем текущее состояние системы
+      this.sendCurrentSystemStatus(ws);
+      
+      // Настраиваем обработчики
+      ws.on('message', (message: string) => {
+        this.handleClientMessage(clientId, message);
+      });
+      
+      ws.on('pong', () => {
+        this.handleClientPong(clientId);
+      });
+      
+      ws.on('close', () => {
+        this.handleClientDisconnect(clientId);
+      });
+      
+      ws.on('error', (error: Error) => {
+        console.error(`❌ [${new Date().toISOString()}] Ошибка клиента ${clientId}:`, error.message);
+        this.handleClientDisconnect(clientId);
+      });
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки нового подключения:`, error);
+    }
+  }
+  
+  private generateClientId(): string {
+    return `CLIENT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+  }
+  
+  private sendWelcomeMessage(ws: WebSocket, clientId: string) {
+    try {
+      const message = {
+        type: 'system:welcome',
+        clientId,
+        timestamp: Date.now(),
+        message: '🎉 Welcome to DTrader WebSocket Server Instance D!',
+        serverInfo: {
+          version: '1.0.0',
+          instance: 'D',
+          protocolVersion: '2.0',
+          nodeEnv: config.NODE_ENV,
+          uptime: process.uptime()
+        },
+        connectionInfo: {
+          clientId,
+          connectedAt: Date.now(),
+          serverTime: new Date().toISOString(),
+          websocketPort: config.WS_PORT
+        },
+        systemStatus: {
+          redisConnected: this.systemStatus.redisConnected,
+          botStatus: this.systemStatus.botStatus,
+          traderStatus: this.systemStatus.traderStatus,
+          lastTradeSignal: this.systemStatus.lastTradeSignal || 'None'
+        },
+        availableEvents: [
+          'system:status',
+          'system:status',
+          'trade:signal',
+          'trade:executed',
+          'trade:error',
+          'market:update',
+          'ping',
+          'pong',
+          'exchange:pong',
+          'bot:pingpong',
+          'exchange:balance'
+        ],
+        availableCommands: {
+          subscribe: 'Subscribe to specific events',
+          unsubscribe: 'Unsubscribe from events',
+          status: 'Get current system status',
+          help: 'Get help information'
+        },
+        documentation: {
+          api: 'https://dtrader.example.com/api-docs',
+          github: 'https://github.com/dtrader-team/dtrader',
+          support: 'support@dtrader.example.com'
+        },
+        tips: [
+          'Use {"type":"ping"} to check connection health',
+          'Send {"type":"status"} to get current system status',
+          'All messages must be valid JSON',
+          'Maximum message size: 16KB'
+        ]
+      };
+      
+      ws.send(JSON.stringify(message, null, 2));
+      console.log(`📩 [${new Date().toISOString()}] Приветственное сообщение отправлено клиенту ${clientId}`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отправки приветственного сообщения:`, error);
+    }
+  }
+  
+  private sendCurrentSystemStatus(ws: WebSocket) {
+    try {
+      const message = {
+        type: 'system:status',
+        data: this.systemStatus,
+        timestamp: Date.now()
+      };
+      
+      ws.send(JSON.stringify(message));
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отправки состояния системы:`, error);
+    }
+  }
+  
+  private handleClientMessage(clientId: string, message: string) {
+    try {
+      const client = this.clients.get(clientId);
+      if (!client) return;
+      
+      console.log(`📩 [${new Date().toISOString()}] Сообщение от клиента ${clientId}:`, message);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки сообщения клиента:`, error);
+    }
+  }
+  
+  private handleClientPong(clientId: string) {
+    try {
+      const client = this.clients.get(clientId);
+      if (!client) return;
+      
+      client.isAlive = true;
+      console.log(`🏓 [${new Date().toISOString()}] PONG получен от клиента ${clientId}`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки pong от клиента:`, error);
+    }
+  }
+  
+  private handleClientDisconnect(clientId: string) {
+    try {
+      this.clients.delete(clientId);
+      console.log(`🔌 [${new Date().toISOString()}] Клиент отключен: ${clientId} (осталось: ${this.clients.size})`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки отключения клиента:`, error);
+    }
+  }
+  
+  private setupPingPong() {
+    const pingIntervalMs = 15000;
+    
+    this.pingInterval = setInterval(() => {
+      this.sendPingToAllClients();
+    }, pingIntervalMs);
+    
+    console.log(`🔄 [${new Date().toISOString()}] Ping-Pong механизм настроен (интервал: ${pingIntervalMs}ms)`);
+  }
+  
+  // ВРЕМЕННО: Настройка периодической отправки тестового сообщения
+  private setupTestBroadcast() {
+    this.testBroadcastInterval = setInterval(() => {
+      this.sendTestMessageToAllClients();
+    }, 5000);
+    
+    console.log(`⚠️  [${new Date().toISOString()}] ВРЕМЕННО: Тестовое вещание настроено (интервал: 5с)`);
+  }
+  
+  private sendTestMessageToAllClients() {
+    try {
+      const testMessage = {
+        type: 'system:test',
+        message: 'Тестовое сообщение для проверки вещания',
+        timestamp: Date.now()
+      };
+      
+      this.clients.forEach((client, clientId) => {
+        if (client.ws.readyState === 1) {
+          try {
+            client.ws.send(JSON.stringify(testMessage));
+          } catch (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка отправки тестового сообщения клиенту ${clientId}:`, error);
+          }
+        }
+      });
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отправки тестового сообщения клиентам:`, error);
+    }
+  }
+
+  /**
+   * Отправляет текущий баланс новому клиенту
+   * @param ws WebSocket соединение
+   * @param clientId ID клиента
+   * @param balanceData Данные баланса
+   */
+  private sendBalanceToClient(ws: WebSocket, clientId: string, balanceData: any) {
+    try {
+      const message = {
+        type: 'exchange:balance',
+        exchange: balanceData.exchange || 'unknown',
+        data: balanceData,
+        timestamp: Date.now(),
+        source: 'exchange'
+      };
+      
+      ws.send(JSON.stringify(message));
+      console.log(`💰 [${new Date().toISOString()}] Текущий баланс отправлен новому клиенту ${clientId}`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отправки баланса клиенту ${clientId}:`, error);
+    }
+  }
+  
+  private sendPingToAllClients() {
+    try {
+      this.clients.forEach((client, clientId) => {
+        if (client.isAlive === false) {
+          console.log(`⚠️  [${new Date().toISOString()}] Клиент ${clientId} не отвечает, закрываем соединение`);
+          client.ws.terminate();
+          return;
+        }
+        
+        client.isAlive = false;
+        
+        try {
+          // Отправляем протокольный PING фрейм вместо текстового сообщения
+          client.ws.ping();
+          console.log(`🏓 [${new Date().toISOString()}] PING отправлен клиенту ${clientId}`);
+        } catch (error) {
+          console.error(`❌ [${new Date().toISOString()}] Ошибка отправки ping клиенту ${clientId}:`, error);
+          client.ws.terminate();
+        }
+      });
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отправки ping клиентам:`, error);
+    }
+  }
+  
+  private async subscribeToEvents() {
+    try {
+      console.log(`📡 [${new Date().toISOString()}] Подписка на события от других инстансов...`);
+      
+      // Подписка на события от бота
+      await this.redisClient.subscribe('bot:events', (message) => {
+        this.handleBotEvent(message);
+      });
+      
+      // Подписка на события исполнения
+      await this.redisClient.subscribe('execution:results', (message) => {
+        this.handleExecutionEvent(message);
+      });
+      
+      // Подписка на обновления состояния
+      await this.redisClient.subscribe('state:updates', (message) => {
+        this.handleStateUpdate(message);
+      });
+      
+      // Подписка на pong сообщения от биржи
+      await this.redisClient.subscribe('exchange:pong', (message) => {
+        console.log(`📩 [${new Date().toISOString()}] Сообщение получено из Redis (exchange:pong): ${message}`);
+        this.handleExchangePong(message);
+      });
+      
+      // Подписка на ping-pong сообщения от бота
+      await this.redisClient.subscribe('bot:pingpong', (message) => {
+        this.handleBotPingPong(message);
+      });
+      
+      // Подписка на сообщения о балансе от биржи
+      await this.redisClient.subscribe('exchange:balance', (message) => {
+        this.handleExchangeBalance(message);
+      });
+      
+      console.log(`✅ [${new Date().toISOString()}] Подписка на события активна`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка подписки на события:`, error);
+    }
+  }
+  
+  private handleBotEvent(message: string) {
+    try {
+      const event = JSON.parse(message);
+      console.log(`🤖 [${new Date().toISOString()}] Событие от бота: ${event.type}`);
+      
+      this.broadcastToAllClients('bot:event', event);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки события от бота:`, error);
+    }
+  }
+  
+  private handleExecutionEvent(message: string) {
+    try {
+      const event = JSON.parse(message);
+      console.log(`💰 [${new Date().toISOString()}] Событие исполнения: ${event.type}`);
+      
+      this.broadcastToAllClients('execution:event', event);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки события исполнения:`, error);
+    }
+  }
+  
+  private handleStateUpdate(message: string) {
+    try {
+      const event = JSON.parse(message);
+      console.log(`🔄 [${new Date().toISOString()}] Обновление состояния: ${event.type}`);
+      
+      this.broadcastToAllClients('state:update', event);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки обновления состояния:`, error);
+    }
+  }
+
+  /**
+   * Обрабатывает ping-pong сообщения от бота
+   * @param message Сообщение от Redis
+   */
+  private handleBotPingPong(message: string) {
+    try {
+      const pingPongData = JSON.parse(message);
+      
+      // Логируем получение сообщения от бота
+      const messageType = pingPongData.type === 'ping' ? 'PING' : 'PONG';
+      console.log(`🤖 [${new Date().toISOString()}] Получено ${messageType} от бота`);
+      console.log(`   📊 [${new Date().toISOString()}] Задержка: ${pingPongData.latency || 'N/A'}ms`);
+      console.log(`   🕒 [${new Date().toISOString()}] Время: ${pingPongData.timestamp ? new Date(pingPongData.timestamp).toISOString() : 'N/A'}`);
+      
+      // Транслируем сообщение всем клиентам
+      this.broadcastBotPingPong(pingPongData);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки ping-pong от бота:`, error);
+      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
+    }
+  }
+
+  /**
+   * Обрабатывает pong сообщение от биржи
+   * @param message Сообщение от Redis
+   */
+  private handleExchangePong(message: string) {
+    try {
+      const pongData = JSON.parse(message);
+      
+      // Логируем получение pong от биржи
+      console.log(`🏓 [${new Date().toISOString()}] Получено pong от биржи ${pongData.exchange || 'unknown'}`);
+      console.log(`   📊 [${new Date().toISOString()}] Задержка: ${pongData.latency || 'N/A'}ms`);
+      console.log(`   🕒 [${new Date().toISOString()}] Время: ${pongData.timestamp ? new Date(pongData.timestamp).toISOString() : 'N/A'}`);
+      
+      // Транслируем pong всем клиентам
+      this.broadcastExchangePong(pongData.exchange || 'unknown', pongData);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки pong от биржи:`, error);
+      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
+    }
+  }
+
+  /**
+   * Обрабатывает сообщения о балансе от биржи
+   * @param message Сообщение от Redis
+   */
+  private handleExchangeBalance(message: string) {
+    try {
+      const balanceData = JSON.parse(message);
+      
+      // Логируем получение баланса от биржи
+      console.log(`💰 [${new Date().toISOString()}] Получен баланс от биржи ${balanceData.exchange || 'unknown'}`);
+      console.log(`   🪙 [${new Date().toISOString()}] Баланс: ${balanceData.balance || 'N/A'}`);
+      console.log(`   🕒 [${new Date().toISOString()}] Время: ${balanceData.timestamp ? new Date(balanceData.timestamp).toISOString() : 'N/A'}`);
+      
+      // Транслируем баланс всем клиентам
+      this.broadcastExchangeBalance(balanceData);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка обработки баланса от биржи:`, error);
+      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
+    }
+  }
+  
+  /**
+   * Транслирует ping-pong сообщение от бота всем клиентам
+   * @param pingPongData Данные ping-pong сообщения
+   */
+  private broadcastBotPingPong(pingPongData: any) {
+    try {
+      const message = {
+        type: 'bot:pingpong',
+        data: pingPongData,
+        timestamp: Date.now(),
+        source: 'bot'
+      };
+      
+      const messageString = JSON.stringify(message);
+      
+      console.log(`📡 [${new Date().toISOString()}] Трансляция ${pingPongData.type} от бота клиентам...`);
+      
+      this.clients.forEach((client, clientId) => {
+        if (client.ws.readyState === 1) {
+          try {
+            client.ws.send(messageString);
+            console.log(`📤 [${new Date().toISOString()}] ${pingPongData.type} от бота отправлен клиенту ${clientId}`);
+          } catch (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка отправки ${pingPongData.type} клиенту ${clientId}:`, error);
+          }
+        }
+      });
+      
+      console.log(`✅ [${new Date().toISOString()}] ${pingPongData.type} от бота транслирован ${this.clients.size} клиентам`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка трансляции ping-pong от бота:`, error);
+    }
+  }
+  
+  private broadcastToAllClients(type: string, data: any) {
+    try {
+      const message = {
+        type,
+        data,
+        timestamp: Date.now()
+      };
+      
+      const messageString = JSON.stringify(message);
+      
+      this.clients.forEach((client, clientId) => {
+        if (client.ws.readyState === 1) {
+          try {
+            client.ws.send(messageString);
+          } catch (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка отправки сообщения клиенту ${clientId}:`, error);
+          }
+        }
+      });
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка трансляции сообщения клиентам:`, error);
+    }
+  }
+
+  /**
+   * Транслирует pong сообщение от биржи всем клиентам
+   * @param exchangeName Название биржи (например, "gateio", "binance")
+   * @param pongData Данные pong сообщения от биржи
+   */
+  public broadcastExchangePong(exchangeName: string, pongData: any) {
+    try {
+      const message = {
+        type: 'exchange:pong',
+        exchange: exchangeName,
+        data: pongData,
+        timestamp: Date.now(),
+        source: 'exchange'
+      };
+      
+      const messageString = JSON.stringify(message);
+      
+      console.log(`🏓 [${new Date().toISOString()}] Трансляция pong от биржи ${exchangeName} клиентам...`);
+      
+      this.clients.forEach((client, clientId) => {
+        if (client.ws.readyState === 1) {
+          try {
+            client.ws.send(messageString);
+            console.log(`📤 [${new Date().toISOString()}] Pong от ${exchangeName} отправлен клиенту ${clientId}`);
+          } catch (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка отправки pong клиенту ${clientId}:`, error);
+          }
+        }
+      });
+      
+      console.log(`✅ [${new Date().toISOString()}] Pong от ${exchangeName} транслирован ${this.clients.size} клиентам`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка трансляции pong от биржи:`, error);
+    }
+  }
+
+  /**
+   * Транслирует сообщение о балансе от биржи всем клиентам
+   * @param balanceData Данные баланса
+   */
+  private broadcastExchangeBalance(balanceData: any) {
+    try {
+      const message = {
+        type: 'exchange:balance',
+        exchange: balanceData.exchange || 'unknown',
+        data: balanceData,
+        timestamp: Date.now(),
+        source: 'exchange'
+      };
+      
+      const messageString = JSON.stringify(message);
+      
+      console.log(`💰 [${new Date().toISOString()}] Трансляция баланса от биржи ${balanceData.exchange || 'unknown'} клиентам...`);
+      
+      this.clients.forEach((client, clientId) => {
+        if (client.ws.readyState === 1) {
+          try {
+            client.ws.send(messageString);
+            console.log(`📤 [${new Date().toISOString()}] Баланс от ${balanceData.exchange || 'unknown'} отправлен клиенту ${clientId}`);
+          } catch (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка отправки баланса клиенту ${clientId}:`, error);
+          }
+        }
+      });
+      
+      console.log(`✅ [${new Date().toISOString()}] Баланс от ${balanceData.exchange || 'unknown'} транслирован ${this.clients.size} клиентам`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка трансляции баланса от биржи:`, error);
+    }
+  }
+  
+  async getStatus() {
+    return {
+      isRunning: this.isRunning,
+      timestamp: Date.now(),
+      activeClients: this.clients.size,
+      systemStatus: this.systemStatus
+    };
+  }
+  
+  async disconnect() {
+    try {
+      if (this.pingInterval) {
+        clearInterval(this.pingInterval);
+      }
+      
+      this.closeAllClientConnections();
+      
+      await this.redisClient.quit();
+      
+      console.log(`🔌 [${new Date().toISOString()}] WebSocket Server соединения закрыты`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка при закрытии соединений:`, error);
+    }
+  }
+  
+  private closeAllClientConnections() {
+    try {
+      this.clients.forEach((client) => {
+        if (client.ws.readyState === 1) {
+          client.ws.close(1001, 'Server shutting down');
+        }
+      });
+      
+      this.clients.clear();
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка закрытия клиентских соединений:`, error);
+    }
+  }
+
+  public async shutdown() {
+    // Предотвращаем многократное выполнение shutdown
+    if (this.isShuttingDown) {
+      console.log(`⚠️  [${new Date().toISOString()}] Процедура завершения уже выполняется, пропуск...`);
+      return;
+    }
+    
+    this.isShuttingDown = true;
+    console.log(`🔄 [${new Date().toISOString()}] Начало процедуры безопасного завершения...`);
+    
+    try {
+      // Отменяем подписки на Redis
+      if (this.redisClient) {
+        try {
+          // Проверяем, не закрыто ли соединение уже
+          if (this.redisClient.isOpen) {
+            await this.redisClient.unsubscribe();
+            await this.redisClient.quit();
+            console.log(`✅ [${new Date().toISOString()}] Redis соединение закрыто`);
+          } else {
+            console.log(`ℹ️  [${new Date().toISOString()}] Redis соединение уже закрыто`);
+          }
+        } catch (redisError) {
+          console.error(`❌ [${new Date().toISOString()}] Ошибка при закрытии Redis соединения:`, redisError);
+        }
+      }
+      
+      // Закрываем все клиентские соединения
+      this.closeAllClientConnections();
+      
+      // Останавливаем ping-pong таймер
+      if (this.pingInterval) {
+        clearInterval(this.pingInterval);
+        this.pingInterval = null;
+        console.log(`✅ [${new Date().toISOString()}] Ping-Pong таймер остановлен`);
+      }
+      
+      // Останавливаем тестовый таймер
+      if (this.testBroadcastInterval) {
+        clearInterval(this.testBroadcastInterval);
+        this.testBroadcastInterval = null;
+        console.log(`✅ [${new Date().toISOString()}] Тестовый таймер остановлен`);
+      }
+      
+      // Закрываем WebSocket сервер
+      if (this.wss) {
+        this.wss.close((error) => {
+          if (error) {
+            console.error(`❌ [${new Date().toISOString()}] Ошибка при закрытии WebSocket сервера:`, error);
+          } else {
+            console.log(`✅ [${new Date().toISOString()}] WebSocket сервер закрыт`);
+          }
+        });
+      }
+      
+      this.isRunning = false;
+      console.log(`✅ [${new Date().toISOString()}] Безопасное завершение завершено`);
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка при безопасном завершении:`, error);
+    }
+  }
+}
+
+// Глобальная переменная для доступа к серверу из обработчиков сигналов
+let wsServerInstance: WebSocketServerInstance | null = null;
+
+// Основная функция
+async function main() {
+  try {
+    console.log(`🚀 [${new Date().toISOString()}] Запуск WebSocket Server Instance D...`);
+    
+    wsServerInstance = new WebSocketServerInstance();
+    await wsServerInstance.initialize();
+    
+    console.log(`🎯 [${new Date().toISOString()}] WebSocket Server Instance D готов к работе!`);
+    console.log(`💡 [${new Date().toISOString()}] Ожидание подключения клиентов...`);
+    
+  } catch (error) {
+    console.error(`❌ [${new Date().toISOString()}] Фатальная ошибка:`, error);
+    process.exit(1);
+  }
+}
+
+// Обработка сигналов
+process.on('SIGINT', async () => {
+  console.log(`\n🛑 [${new Date().toISOString()}] Получен сигнал SIGINT. Завершение работы...`);
+  if (wsServerInstance) {
+    await wsServerInstance.shutdown();
+  }
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log(`\n🛑 [${new Date().toISOString()}] Получен сигнал SIGTERM. Завершение работы...`);
+  if (wsServerInstance) {
+    await wsServerInstance.shutdown();
+  }
+  process.exit(0);
+});
+
+// Обработка необработанных ошибок
+process.on('uncaughtException', (error) => {
+  console.error(`❌ [${new Date().toISOString()}] Необработанная ошибка:`, error);
+  if (wsServerInstance) {
+    wsServerInstance.shutdown().then(() => process.exit(1));
+  } else {
+    process.exit(1);
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error(`❌ [${new Date().toISOString()}] Необработанный rejection:`, reason);
+  if (wsServerInstance) {
+    wsServerInstance.shutdown().then(() => process.exit(1));
+  } else {
+    process.exit(1);
+  }
+});
+
+// Обработка SIGHUP (закрытие терминала)
+process.on('SIGHUP', async () => {
+  console.log(`\n🛑 [${new Date().toISOString()}] Получен сигнал SIGHUP. Завершение работы...`);
+  if (wsServerInstance) {
+    await wsServerInstance.shutdown();
+  }
+  process.exit(0);
+});
+
+// Таймаут для завершения (максимум 10 секунд)
+let shutdownTimeout: NodeJS.Timeout | null = null;
+
+async function gracefulShutdown(signal: string) {
+  console.log(`\n🛑 [${new Date().toISOString()}] Получен сигнал ${signal}. Начало безопасного завершения...`);
+  
+  if (wsServerInstance) {
+    try {
+      // Устанавливаем таймаут на завершение
+      shutdownTimeout = setTimeout(() => {
+        console.error(`❌ [${new Date().toISOString()}] Таймаут завершения (10с), принудительное завершение...`);
+        process.exit(1);
+      }, 10000);
+      
+      await wsServerInstance.shutdown();
+      
+      if (shutdownTimeout) {
+        clearTimeout(shutdownTimeout);
+      }
+      
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка при завершении:`, error);
+      process.exit(1);
+    }
+  }
+  
+  process.exit(0);
+}
+
+// Переопределяем обработчики с таймаутом
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+
+// Запуск
+main().catch(error => {
+  console.error(`❌ [${new Date().toISOString()}] Фатальная ошибка:`, error);
+  gracefulShutdown('FAILURE');
+});

@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  # Instance A: Redis - Единый источник истины и Event Bus
+  redis:
+    image: redis:7.0-alpine
+    container_name: dtrader-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+      - ./redis/data:/data
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - dtrader-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Instance B: Node.js стратегия
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: dtrader-bot
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${BOT_PORT}:${BOT_PORT}"
+      - "${TRADER_PORT}:${TRADER_PORT}"
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVER_PORT=${SERVER_PORT}
+      - WS_PORT=${WS_PORT}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - GATEIO_API_KEY=${GATEIO_API_KEY}
+      - GATEIO_API_SECRET=${GATEIO_API_SECRET}
+      - WS_PING_INTERVAL=${WS_PING_INTERVAL}
+      - WS_PING_TIMEOUT=${WS_PING_TIMEOUT}
+    volumes:
+      - ./bot/src:/app/src
+      - ./bot/dist:/app/dist
+    networks:
+      - dtrader-network
+    command: npm run start:dev
+
+  # Instance C: Node.js трейдер (заглушка)
+  trader:
+    build:
+      context: ./trader
+      dockerfile: Dockerfile
+    container_name: dtrader-trader
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVER_PORT=${SERVER_PORT}
+      - WS_PORT=${WS_PORT}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - GATEIO_API_KEY=${GATEIO_API_KEY}
+      - GATEIO_API_SECRET=${GATEIO_API_SECRET}
+      - WS_PING_INTERVAL=${WS_PING_INTERVAL}
+      - WS_PING_TIMEOUT=${WS_PING_TIMEOUT}
+    volumes:
+      - ./trader/src:/app/src
+      - ./trader/dist:/app/dist
+    networks:
+      - dtrader-network
+    command: npm run start:dev
+
+  # Instance D: WebSocket сервер
+  ws-server:
+    build:
+      context: ./ws-server
+      dockerfile: Dockerfile
+    container_name: dtrader-ws-server
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${WS_SERVER_PORT}:${WS_SERVER_PORT}"
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVER_PORT=${SERVER_PORT}
+      - WS_PORT=${WS_PORT}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - WS_PING_INTERVAL=${WS_PING_INTERVAL}
+      - WS_PING_TIMEOUT=${WS_PING_TIMEOUT}
+    volumes:
+      - ./ws-server/src:/app/src
+      - ./ws-server/dist:/app/dist
+    networks:
+      - dtrader-network
+    command: npm run start:dev
+
+networks:
+  dtrader-network:
+    driver: bridge

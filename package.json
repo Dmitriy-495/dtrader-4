@@ -1,27 +1,16 @@
 {
-  "name": "dtrader-4",
+  "name": "dtrader-4-root",
   "version": "1.0.0",
-  "description": "DTrader-4 Server Application",
-  "main": "dist/index.js",
+  "private": true,
+  "description": "Root package for dtrader-4 configuration",
   "scripts": {
-    "start": "npm run build && node dist/index.js",
-    "dev": "nodemon --exec ts-node src/index.ts",
-    "build": "tsc",
-    "build:watch": "tsc --watch"
+    "test:config": "node test_config.js"
   },
   "dependencies": {
-    "axios": "^1.13.2",
-    "dotenv": "^16.3.1",
-    "ws": "^8.14.2"
+    "dotenv": "^16.6.1"
   },
   "devDependencies": {
-    "@types/dotenv": "^6.1.1",
-    "@types/node": "^25.0.1",
-    "@types/ws": "^8.18.1",
-    "nodemon": "^3.1.11",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
-  },
-  "author": "Your Name",
-  "license": "MIT"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
 }

@@ -1,0 +1,27 @@
+{
+  "name": "dtrader-ws-server",
+  "version": "1.0.0",
+  "description": "DTrader WebSocket Server - Instance D",
+  "main": "dist/app.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app.js",
+    "start:dev": "nodemon --watch 'src/**/*.ts' --exec 'ts-node src/app.ts'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["trading", "websocket", "redis", "event-bus"],
+  "author": "DTrader Team",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.13.0",
+    "redis": "^4.6.7",
+    "dotenv": "^16.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^18.16.0",
+    "@types/ws": "^8.5.4",
+    "typescript": "^5.0.4",
+    "ts-node": "^10.9.1",
+    "nodemon": "^2.0.22"
+  }
+}

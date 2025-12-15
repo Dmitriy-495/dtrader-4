@@ -1,0 +1,10 @@
+// Конфигурация для Trader Instance
+import { baseConfig, BaseConfig } from '../config';
+
+export interface TraderConfig extends BaseConfig {
+  // Специфичные настройки для трейдера
+}
+
+export const config: TraderConfig = {
+  ...baseConfig
+};
