@@ -4,8 +4,10 @@ import * as path from "path";
 
 // Определяем путь к .env файлу
 // Используем корень проекта (на уровень выше директории bot)
+
 const rootEnvPath = path.resolve(__dirname, "../../../.env");
 dotenv.config({ path: rootEnvPath });
+console.log(rootEnvPath);
 
 // Логируем загрузку конфигурации
 console.log("📁 Загрузка конфигурации из:", rootEnvPath);

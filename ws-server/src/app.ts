@@ -1,8 +1,10 @@
 // DTrader WebSocket Server Instance - Instance D
-// Трансляция данных клиентам
+// Трансляция данных клиентам с аутентификацией
 
 import { WebSocketServer, WebSocket } from "ws";
 import { createClient, RedisClientType } from "redis";
+import * as crypto from "crypto";
+import * as http from "http";
 import dotenv from "dotenv";
 import { baseConfig as config } from "./config/config";
 
@@ -13,6 +15,7 @@ interface ClientInfo {
   ws: WebSocket;
   isAlive: boolean;
   connectedAt: number;
+  token: string;
   subscriptions: {
     exchanges: Set<string>;
     events: Set<string>;
@@ -27,6 +30,13 @@ interface SystemStatus {
   lastTradeSignal?: string;
 }
 
+interface AuthToken {
+  token: string;
+  createdAt: number;
+  expiresAt: number;
+  clientId?: string;
+}
+
 class WebSocketServerInstance {
   private wss?: WebSocketServer;
   private redisClient: RedisClientType;
@@ -36,13 +46,17 @@ class WebSocketServerInstance {
   private exchangeBalance: any | null;
   private isRunning: boolean;
   private isShuttingDown: boolean;
+  private validTokens: Map<string, AuthToken>;
+  private tokenCleanupInterval: NodeJS.Timeout | null;
 
   constructor() {
     this.isShuttingDown = false;
     this.exchangeBalance = null;
     this.clients = new Map();
     this.pingInterval = null;
+    this.tokenCleanupInterval = null;
     this.isRunning = false;
+    this.validTokens = new Map();
 
     this.systemStatus = {
       timestamp: Date.now(),
@@ -77,7 +91,12 @@ class WebSocketServerInstance {
 
       // Создаем WebSocket сервер
       try {
-        this.wss = new WebSocketServer({ port: config.WS_PORT });
+        this.wss = new WebSocketServer({
+          port: config.WS_PORT,
+          verifyClient: (info, callback) => {
+            this.verifyClient(info, callback);
+          },
+        });
         console.log(
           `📡 [${new Date().toISOString()}] WebSocket сервер запущен на ws://localhost:${
             config.WS_PORT
@@ -93,7 +112,7 @@ class WebSocketServerInstance {
         console.error(
           `   [${new Date().toISOString()}] Порт уже занят или недоступен`
         );
-        process.exit(1); // Немедленно завершаем процесс
+        process.exit(1);
       }
 
       // Настраиваем обработчики
@@ -102,8 +121,14 @@ class WebSocketServerInstance {
       // Настраиваем ping-pong
       this.setupPingPong();
 
+      // Настраиваем очистку токенов
+      this.setupTokenCleanup();
+
       // Подписываемся на события
       await this.subscribeToEvents();
+
+      // Генерируем начальные токены для тестирования
+      this.generateInitialTokens();
 
       this.isRunning = true;
     } catch (error) {
@@ -115,11 +140,160 @@ class WebSocketServerInstance {
     }
   }
 
+  // ============== АУТЕНТИФИКАЦИЯ ==============
+
+  private verifyClient(
+    info: { origin: string; secure: boolean; req: http.IncomingMessage },
+    callback: (result: boolean, code?: number, message?: string) => void
+  ) {
+    try {
+      const token = this.extractToken(info.req);
+
+      if (!token) {
+        console.log(
+          `🚫 [${new Date().toISOString()}] Попытка подключения без токена`
+        );
+        callback(false, 401, "Unauthorized: No token provided");
+        return;
+      }
+
+      if (!this.isTokenValid(token)) {
+        console.log(
+          `🚫 [${new Date().toISOString()}] Попытка подключения с недействительным токеном`
+        );
+        callback(false, 401, "Unauthorized: Invalid or expired token");
+        return;
+      }
+
+      console.log(`✅ [${new Date().toISOString()}] Токен проверен успешно`);
+      callback(true);
+    } catch (error) {
+      console.error(
+        `❌ [${new Date().toISOString()}] Ошибка проверки токена:`,
+        error
+      );
+      callback(false, 500, "Internal server error");
+    }
+  }
+
+  private extractToken(req: http.IncomingMessage): string | null {
+    try {
+      // Пробуем извлечь из URL параметра ?token=xxx
+      const url = new URL(req.url || "", `ws://${req.headers.host}`);
+      const tokenFromUrl = url.searchParams.get("token");
+      if (tokenFromUrl) return tokenFromUrl;
+
+      // Пробуем извлечь из заголовка Authorization: Bearer xxx
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        return authHeader.substring(7);
+      }
+
+      return null;
+    } catch (error) {
+      console.error(
+        `❌ [${new Date().toISOString()}] Ошибка извлечения токена:`,
+        error
+      );
+      return null;
+    }
+  }
+
+  private isTokenValid(token: string): boolean {
+    const authToken = this.validTokens.get(token);
+    if (!authToken) return false;
+
+    if (Date.now() > authToken.expiresAt) {
+      this.validTokens.delete(token);
+      return false;
+    }
+
+    return true;
+  }
+
+  public generateToken(expiresInMinutes: number = 60): string {
+    const token = crypto.randomBytes(32).toString("hex");
+    const now = Date.now();
+    const expiresAt = now + expiresInMinutes * 60 * 1000;
+
+    this.validTokens.set(token, {
+      token,
+      createdAt: now,
+      expiresAt,
+    });
+
+    console.log(
+      `🔑 [${new Date().toISOString()}] Создан новый токен (expires: ${new Date(
+        expiresAt
+      ).toISOString()})`
+    );
+
+    return token;
+  }
+
+  public revokeToken(token: string): boolean {
+    const deleted = this.validTokens.delete(token);
+    if (deleted) {
+      console.log(`🔑 [${new Date().toISOString()}] Токен отозван`);
+    }
+    return deleted;
+  }
+
+  private setupTokenCleanup() {
+    // Очистка истекших токенов каждые 5 минут
+    this.tokenCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+
+      this.validTokens.forEach((authToken, token) => {
+        if (now > authToken.expiresAt) {
+          this.validTokens.delete(token);
+          cleaned++;
+        }
+      });
+
+      if (cleaned > 0) {
+        console.log(
+          `🧹 [${new Date().toISOString()}] Очищено истекших токенов: ${cleaned}`
+        );
+      }
+    }, 5 * 60 * 1000);
+
+    console.log(
+      `🔄 [${new Date().toISOString()}] Автоматическая очистка токенов настроена (каждые 5 минут)`
+    );
+  }
+
+  private generateInitialTokens() {
+    // Генерируем токены для тестирования
+    const testToken1 = this.generateToken(1440); // 24 часа
+    const testToken2 = this.generateToken(60); // 1 час
+
+    console.log(`
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                        ТЕСТОВЫЕ ТОКЕНЫ ДОСТУПА                            ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                                                                           ║
+║  Токен 1 (24 часа):                                                      ║
+║  ${testToken1}  ║
+║                                                                           ║
+║  Токен 2 (1 час):                                                        ║
+║  ${testToken2}  ║
+║                                                                           ║
+║  Использование:                                                           ║
+║  ws://localhost:${config.WS_PORT}?token=YOUR_TOKEN                                   ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+    `);
+  }
+
+  // ============== WEBSOCKET HANDLERS ==============
+
   private setupWebSocketHandlers() {
     if (!this.wss) return;
 
-    this.wss.on("connection", (ws: WebSocket) => {
-      this.handleNewConnection(ws);
+    this.wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
+      this.handleNewConnection(ws, req);
     });
 
     this.wss.on("error", (error: unknown) => {
@@ -141,15 +315,22 @@ class WebSocketServerInstance {
     });
   }
 
-  private handleNewConnection(ws: WebSocket) {
+  private handleNewConnection(ws: WebSocket, req: http.IncomingMessage) {
     try {
       const clientId = this.generateClientId();
+      const token = this.extractToken(req);
+
+      if (!token) {
+        ws.close(1008, "No token provided");
+        return;
+      }
 
       const clientInfo: ClientInfo = {
         id: clientId,
         ws,
         isAlive: true,
         connectedAt: Date.now(),
+        token,
         subscriptions: {
           exchanges: new Set<string>(),
           events: new Set<string>(),
@@ -157,6 +338,12 @@ class WebSocketServerInstance {
       };
 
       this.clients.set(clientId, clientInfo);
+
+      // Привязываем токен к клиенту
+      const authToken = this.validTokens.get(token);
+      if (authToken) {
+        authToken.clientId = clientId;
+      }
 
       console.log(
         `🔌 [${new Date().toISOString()}] Новый клиент подключен: ${clientId} (всего: ${
@@ -176,8 +363,8 @@ class WebSocketServerInstance {
       this.sendCurrentSystemStatus(ws);
 
       // Настраиваем обработчики
-      ws.on("message", (message: string) => {
-        this.handleClientMessage(clientId, message);
+      ws.on("message", (message: Buffer) => {
+        this.handleClientMessage(clientId, message.toString());
       });
 
       ws.on("pong", () => {
@@ -200,6 +387,7 @@ class WebSocketServerInstance {
         `❌ [${new Date().toISOString()}] Ошибка обработки нового подключения:`,
         error
       );
+      ws.close(1011, "Internal server error");
     }
   }
 
@@ -220,6 +408,7 @@ class WebSocketServerInstance {
           protocolVersion: "2.0",
           nodeEnv: config.NODE_ENV,
           uptime: process.uptime(),
+          authenticated: true,
         },
         connectionInfo: {
           clientId,
@@ -261,6 +450,7 @@ class WebSocketServerInstance {
           'Send {"type":"status"} to get current system status',
           "All messages must be valid JSON",
           "Maximum message size: 16KB",
+          "Keep your authentication token secure",
         ],
       };
 
@@ -302,11 +492,136 @@ class WebSocketServerInstance {
         `📩 [${new Date().toISOString()}] Сообщение от клиента ${clientId}:`,
         message
       );
+
+      // Парсим сообщение
+      try {
+        const data = JSON.parse(message);
+
+        // Обрабатываем команды
+        switch (data.type) {
+          case "ping":
+            this.handlePingCommand(client);
+            break;
+          case "status":
+            this.sendCurrentSystemStatus(client.ws);
+            break;
+          case "subscribe":
+            this.handleSubscribeCommand(client, data);
+            break;
+          case "unsubscribe":
+            this.handleUnsubscribeCommand(client, data);
+            break;
+          default:
+            console.log(
+              `⚠️  [${new Date().toISOString()}] Неизвестная команда: ${
+                data.type
+              }`
+            );
+        }
+      } catch (parseError) {
+        console.error(
+          `❌ [${new Date().toISOString()}] Ошибка парсинга сообщения:`,
+          parseError
+        );
+        client.ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Invalid JSON format",
+            timestamp: Date.now(),
+          })
+        );
+      }
     } catch (error) {
       console.error(
         `❌ [${new Date().toISOString()}] Ошибка обработки сообщения клиента:`,
         error
       );
+    }
+  }
+
+  private handlePingCommand(client: ClientInfo) {
+    try {
+      client.ws.send(
+        JSON.stringify({
+          type: "pong",
+          timestamp: Date.now(),
+        })
+      );
+    } catch (error) {
+      console.error(
+        `❌ [${new Date().toISOString()}] Ошибка отправки pong:`,
+        error
+      );
+    }
+  }
+
+  private handleSubscribeCommand(client: ClientInfo, data: any) {
+    try {
+      if (data.events && Array.isArray(data.events)) {
+        data.events.forEach((event: string) => {
+          client.subscriptions.events.add(event);
+        });
+      }
+
+      if (data.exchanges && Array.isArray(data.exchanges)) {
+        data.exchanges.forEach((exchange: string) => {
+          client.subscriptions.exchanges.add(exchange);
+        });
+      }
+
+      client.ws.send(
+        JSON.stringify({
+          type: "subscribed",
+          subscriptions: {
+            events: Array.from(client.subscriptions.events),
+            exchanges: Array.from(client.subscriptions.exchanges),
+          },
+          timestamp: Date.now(),
+        })
+      );
+
+      console.log(
+        `📡 [${new Date().toISOString()}] Клиент ${
+          client.id
+        } подписался на события`
+      );
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка подписки:`, error);
+    }
+  }
+
+  private handleUnsubscribeCommand(client: ClientInfo, data: any) {
+    try {
+      if (data.events && Array.isArray(data.events)) {
+        data.events.forEach((event: string) => {
+          client.subscriptions.events.delete(event);
+        });
+      }
+
+      if (data.exchanges && Array.isArray(data.exchanges)) {
+        data.exchanges.forEach((exchange: string) => {
+          client.subscriptions.exchanges.delete(exchange);
+        });
+      }
+
+      client.ws.send(
+        JSON.stringify({
+          type: "unsubscribed",
+          subscriptions: {
+            events: Array.from(client.subscriptions.events),
+            exchanges: Array.from(client.subscriptions.exchanges),
+          },
+          timestamp: Date.now(),
+        })
+      );
+
+      console.log(
+        `📡 [${new Date().toISOString()}] Клиент ${
+          client.id
+        } отписался от событий`
+      );
+    } catch (error) {
+      console.error(`❌ [${new Date().toISOString()}] Ошибка отписки:`, error);
     }
   }
 
@@ -329,6 +644,12 @@ class WebSocketServerInstance {
 
   private handleClientDisconnect(clientId: string) {
     try {
+      const client = this.clients.get(clientId);
+      if (client && client.token) {
+        // Можно отозвать токен при отключении (опционально)
+        // this.revokeToken(client.token);
+      }
+
       this.clients.delete(clientId);
       console.log(
         `🔌 [${new Date().toISOString()}] Клиент отключен: ${clientId} (осталось: ${
@@ -343,6 +664,8 @@ class WebSocketServerInstance {
     }
   }
 
+  // ============== PING-PONG ==============
+
   private setupPingPong() {
     const pingIntervalMs = 15000;
 
@@ -355,12 +678,6 @@ class WebSocketServerInstance {
     );
   }
 
-  /**
-   * Отправляет текущий баланс новому клиенту
-   * @param ws WebSocket соединение
-   * @param clientId ID клиента
-   * @param balanceData Данные баланса
-   */
   private sendBalanceToClient(
     ws: WebSocket,
     clientId: string,
@@ -401,7 +718,6 @@ class WebSocketServerInstance {
         client.isAlive = false;
 
         try {
-          // Отправляем протокольный PING фрейм вместо текстового сообщения
           client.ws.ping();
           console.log(
             `🏓 [${new Date().toISOString()}] PING отправлен клиенту ${clientId}`
@@ -422,41 +738,34 @@ class WebSocketServerInstance {
     }
   }
 
+  // ============== REDIS EVENTS ==============
+
   private async subscribeToEvents() {
     try {
       console.log(
         `📡 [${new Date().toISOString()}] Подписка на события от других инстансов...`
       );
 
-      // Подписка на события от бота
       await this.redisClient.subscribe("bot:events", (message) => {
         this.handleBotEvent(message);
       });
 
-      // Подписка на события исполнения
       await this.redisClient.subscribe("execution:results", (message) => {
         this.handleExecutionEvent(message);
       });
 
-      // Подписка на обновления состояния
       await this.redisClient.subscribe("state:updates", (message) => {
         this.handleStateUpdate(message);
       });
 
-      // Подписка на pong сообщения от биржи
       await this.redisClient.subscribe("exchange:pong", (message) => {
-        console.log(
-          `📩 [${new Date().toISOString()}] Сообщение получено из Redis (exchange:pong): ${message}`
-        );
         this.handleExchangePong(message);
       });
 
-      // Подписка на ping-pong сообщения от бота
       await this.redisClient.subscribe("bot:pingpong", (message) => {
         this.handleBotPingPong(message);
       });
 
-      // Подписка на сообщения о балансе от биржи
       await this.redisClient.subscribe("exchange:balance", (message) => {
         this.handleExchangeBalance(message);
       });
@@ -520,311 +829,187 @@ class WebSocketServerInstance {
     }
   }
 
-  /**
-   * Обрабатывает ping-pong сообщения от бота
-   * @param message Сообщение от Redis
-   */
   private handleBotPingPong(message: string) {
     try {
       const pingPongData = JSON.parse(message);
 
-      // Логируем получение сообщения от бота
       const messageType = pingPongData.type === "ping" ? "PING" : "PONG";
       console.log(
         `🤖 [${new Date().toISOString()}] Получено ${messageType} от бота`
       );
-      console.log(
-        `   📊 [${new Date().toISOString()}] Задержка: ${
-          pingPongData.latency || "N/A"
-        }ms`
-      );
-      console.log(
-        `   🕒 [${new Date().toISOString()}] Время: ${
-          pingPongData.timestamp
-            ? new Date(pingPongData.timestamp).toISOString()
-            : "N/A"
-        }`
-      );
 
-      // Транслируем сообщение всем клиентам
-      this.broadcastBotPingPong(pingPongData);
+      this.broadcastTypedMessage("bot:pingpong", pingPongData, "bot");
     } catch (error) {
       console.error(
         `❌ [${new Date().toISOString()}] Ошибка обработки ping-pong от бота:`,
         error
       );
-      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
     }
   }
 
-  /**
-   * Обрабатывает pong сообщение от биржи
-   * @param message Сообщение от Redis
-   */
   private handleExchangePong(message: string) {
     try {
       const pongData = JSON.parse(message);
 
-      // Логируем получение pong от биржи
       console.log(
         `🏓 [${new Date().toISOString()}] Получено pong от биржи ${
           pongData.exchange || "unknown"
         }`
       );
-      console.log(
-        `   📊 [${new Date().toISOString()}] Задержка: ${
-          pongData.latency || "N/A"
-        }ms`
-      );
-      console.log(
-        `   🕒 [${new Date().toISOString()}] Время: ${
-          pongData.timestamp
-            ? new Date(pongData.timestamp).toISOString()
-            : "N/A"
-        }`
-      );
 
-      // Транслируем pong всем клиентам
-      this.broadcastExchangePong(pongData.exchange || "unknown", pongData);
+      this.broadcastTypedMessage(
+        "exchange:pong",
+        pongData,
+        "exchange",
+        pongData.exchange || "unknown"
+      );
     } catch (error) {
       console.error(
         `❌ [${new Date().toISOString()}] Ошибка обработки pong от биржи:`,
         error
       );
-      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
     }
   }
 
-  /**
-   * Обрабатывает сообщения о балансе от биржи
-   * @param message Сообщение от Redis
-   */
   private handleExchangeBalance(message: string) {
     try {
       const balanceData = JSON.parse(message);
 
-      // Логируем получение баланса от биржи
       console.log(
         `💰 [${new Date().toISOString()}] Получен баланс от биржи ${
           balanceData.exchange || "unknown"
         }`
       );
-      console.log(
-        `   🪙 [${new Date().toISOString()}] Баланс: ${
-          balanceData.balance || "N/A"
-        }`
-      );
-      console.log(
-        `   🕒 [${new Date().toISOString()}] Время: ${
-          balanceData.timestamp
-            ? new Date(balanceData.timestamp).toISOString()
-            : "N/A"
-        }`
-      );
 
-      // Транслируем баланс всем клиентам
-      this.broadcastExchangeBalance(balanceData);
+      // Сохраняем баланс для новых клиентов
+      this.exchangeBalance = balanceData;
+
+      this.broadcastTypedMessage(
+        "exchange:balance",
+        balanceData,
+        "exchange",
+        balanceData.exchange || "unknown"
+      );
     } catch (error) {
       console.error(
         `❌ [${new Date().toISOString()}] Ошибка обработки баланса от биржи:`,
         error
       );
-      console.log(`📄 [${new Date().toISOString()}] Сырые данные: ${message}`);
     }
   }
 
-  /**
-   * Транслирует ping-pong сообщение от бота всем клиентам
-   * @param pingPongData Данные ping-pong сообщения
-   */
-  private broadcastBotPingPong(pingPongData: any) {
+  // ============== BROADCAST METHODS ==============
+
+  private broadcastTypedMessage(
+    type: string,
+    data: any,
+    source: string,
+    exchange?: string
+  ) {
     try {
-      const message = {
-        type: "bot:pingpong",
-        data: pingPongData,
-        timestamp: Date.now(),
-        source: "bot",
-      };
-
-      const messageString = JSON.stringify(message);
-
-      console.log(
-        `📡 [${new Date().toISOString()}] Трансляция ${
-          pingPongData.type
-        } от бота клиентам...`
-      );
-
-      this.clients.forEach((client, clientId) => {
-        if (client.ws.readyState === 1) {
-          try {
-            client.ws.send(messageString);
-            console.log(
-              `📤 [${new Date().toISOString()}] ${
-                pingPongData.type
-              } от бота отправлен клиенту ${clientId}`
-            );
-          } catch (error) {
-            console.error(
-              `❌ [${new Date().toISOString()}] Ошибка отправки ${
-                pingPongData.type
-              } клиенту ${clientId}:`,
-              error
-            );
-          }
-        }
-      });
-
-      console.log(
-        `✅ [${new Date().toISOString()}] ${
-          pingPongData.type
-        } от бота транслирован ${this.clients.size} клиентам`
-      );
-    } catch (error) {
-      console.error(
-        `❌ [${new Date().toISOString()}] Ошибка трансляции ping-pong от бота:`,
-        error
-      );
-    }
-  }
-
-  private broadcastToAllClients(type: string, data: any) {
-    try {
-      const message = {
+      const message: any = {
         type,
         data,
         timestamp: Date.now(),
+        source,
       };
+
+      if (exchange) {
+        message.exchange = exchange;
+      }
 
       const messageString = JSON.stringify(message);
 
+      console.log(
+        `📡 [${new Date().toISOString()}] Трансляция ${type} от ${source} клиентам...`
+      );
+
+      let sentCount = 0;
       this.clients.forEach((client, clientId) => {
-        if (client.ws.readyState === 1) {
+        // Проверяем подписки клиента (если есть)
+        const shouldSend = this.shouldSendToClient(client, type, exchange);
+
+        if (client.ws.readyState === 1 && shouldSend) {
           try {
             client.ws.send(messageString);
+            sentCount++;
+            console.log(
+              `📤 [${new Date().toISOString()}] ${type} отправлен клиенту ${clientId}`
+            );
           } catch (error) {
             console.error(
-              `❌ [${new Date().toISOString()}] Ошибка отправки сообщения клиенту ${clientId}:`,
+              `❌ [${new Date().toISOString()}] Ошибка отправки клиенту ${clientId}:`,
               error
             );
           }
         }
       });
+
+      console.log(
+        `✅ [${new Date().toISOString()}] ${type} транслирован ${sentCount} клиентам`
+      );
     } catch (error) {
       console.error(
-        `❌ [${new Date().toISOString()}] Ошибка трансляции сообщения клиентам:`,
+        `❌ [${new Date().toISOString()}] Ошибка трансляции ${type}:`,
         error
       );
     }
   }
 
-  /**
-   * Транслирует pong сообщение от биржи всем клиентам
-   * @param exchangeName Название биржи (например, "gateio", "binance")
-   * @param pongData Данные pong сообщения от биржи
-   */
+  private shouldSendToClient(
+    client: ClientInfo,
+    eventType: string,
+    exchange?: string
+  ): boolean {
+    // Если клиент не настроил подписки - отправляем все
+    if (
+      client.subscriptions.events.size === 0 &&
+      client.subscriptions.exchanges.size === 0
+    ) {
+      return true;
+    }
+
+    // Проверяем подписку на событие
+    if (
+      client.subscriptions.events.size > 0 &&
+      !client.subscriptions.events.has(eventType)
+    ) {
+      return false;
+    }
+
+    // Проверяем подписку на биржу
+    if (
+      exchange &&
+      client.subscriptions.exchanges.size > 0 &&
+      !client.subscriptions.exchanges.has(exchange)
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private broadcastToAllClients(type: string, data: any) {
+    this.broadcastTypedMessage(type, data, "system");
+  }
+
   public broadcastExchangePong(exchangeName: string, pongData: any) {
-    try {
-      const message = {
-        type: "exchange:pong",
-        exchange: exchangeName,
-        data: pongData,
-        timestamp: Date.now(),
-        source: "exchange",
-      };
-
-      const messageString = JSON.stringify(message);
-
-      console.log(
-        `🏓 [${new Date().toISOString()}] Трансляция pong от биржи ${exchangeName} клиентам...`
-      );
-
-      this.clients.forEach((client, clientId) => {
-        if (client.ws.readyState === 1) {
-          try {
-            client.ws.send(messageString);
-            console.log(
-              `📤 [${new Date().toISOString()}] Pong от ${exchangeName} отправлен клиенту ${clientId}`
-            );
-          } catch (error) {
-            console.error(
-              `❌ [${new Date().toISOString()}] Ошибка отправки pong клиенту ${clientId}:`,
-              error
-            );
-          }
-        }
-      });
-
-      console.log(
-        `✅ [${new Date().toISOString()}] Pong от ${exchangeName} транслирован ${
-          this.clients.size
-        } клиентам`
-      );
-    } catch (error) {
-      console.error(
-        `❌ [${new Date().toISOString()}] Ошибка трансляции pong от биржи:`,
-        error
-      );
-    }
+    this.broadcastTypedMessage(
+      "exchange:pong",
+      pongData,
+      "exchange",
+      exchangeName
+    );
   }
 
-  /**
-   * Транслирует сообщение о балансе от биржи всем клиентам
-   * @param balanceData Данные баланса
-   */
-  private broadcastExchangeBalance(balanceData: any) {
-    try {
-      const message = {
-        type: "exchange:balance",
-        exchange: balanceData.exchange || "unknown",
-        data: balanceData,
-        timestamp: Date.now(),
-        source: "exchange",
-      };
-
-      const messageString = JSON.stringify(message);
-
-      console.log(
-        `💰 [${new Date().toISOString()}] Трансляция баланса от биржи ${
-          balanceData.exchange || "unknown"
-        } клиентам...`
-      );
-
-      this.clients.forEach((client, clientId) => {
-        if (client.ws.readyState === 1) {
-          try {
-            client.ws.send(messageString);
-            console.log(
-              `📤 [${new Date().toISOString()}] Баланс от ${
-                balanceData.exchange || "unknown"
-              } отправлен клиенту ${clientId}`
-            );
-          } catch (error) {
-            console.error(
-              `❌ [${new Date().toISOString()}] Ошибка отправки баланса клиенту ${clientId}:`,
-              error
-            );
-          }
-        }
-      });
-
-      console.log(
-        `✅ [${new Date().toISOString()}] Баланс от ${
-          balanceData.exchange || "unknown"
-        } транслирован ${this.clients.size} клиентам`
-      );
-    } catch (error) {
-      console.error(
-        `❌ [${new Date().toISOString()}] Ошибка трансляции баланса от биржи:`,
-        error
-      );
-    }
-  }
+  // ============== SHUTDOWN ==============
 
   async getStatus() {
     return {
       isRunning: this.isRunning,
       timestamp: Date.now(),
       activeClients: this.clients.size,
+      activeTokens: this.validTokens.size,
       systemStatus: this.systemStatus,
     };
   }
@@ -833,6 +1018,10 @@ class WebSocketServerInstance {
     try {
       if (this.pingInterval) {
         clearInterval(this.pingInterval);
+      }
+
+      if (this.tokenCleanupInterval) {
+        clearInterval(this.tokenCleanupInterval);
       }
 
       this.closeAllClientConnections();
@@ -868,10 +1057,9 @@ class WebSocketServerInstance {
   }
 
   public async shutdown() {
-    // Предотвращаем многократное выполнение shutdown
     if (this.isShuttingDown) {
       console.log(
-        `⚠️  [${new Date().toISOString()}] Процедура завершения уже выполняется, пропуск...`
+        `⚠️  [${new Date().toISOString()}] Процедура завершения уже выполняется`
       );
       return;
     }
@@ -882,42 +1070,26 @@ class WebSocketServerInstance {
     );
 
     try {
-      // Отменяем подписки на Redis
-      if (this.redisClient) {
-        try {
-          // Проверяем, не закрыто ли соединение уже
-          if (this.redisClient.isOpen) {
-            await this.redisClient.unsubscribe();
-            await this.redisClient.quit();
-            console.log(
-              `✅ [${new Date().toISOString()}] Redis соединение закрыто`
-            );
-          } else {
-            console.log(
-              `ℹ️  [${new Date().toISOString()}] Redis соединение уже закрыто`
-            );
-          }
-        } catch (redisError) {
-          console.error(
-            `❌ [${new Date().toISOString()}] Ошибка при закрытии Redis соединения:`,
-            redisError
-          );
-        }
-      }
-
-      // Закрываем все клиентские соединения
-      this.closeAllClientConnections();
-
-      // Останавливаем ping-pong таймер
-      if (this.pingInterval) {
-        clearInterval(this.pingInterval);
-        this.pingInterval = null;
+      if (this.redisClient && this.redisClient.isOpen) {
+        await this.redisClient.unsubscribe();
+        await this.redisClient.quit();
         console.log(
-          `✅ [${new Date().toISOString()}] Ping-Pong таймер остановлен`
+          `✅ [${new Date().toISOString()}] Redis соединение закрыто`
         );
       }
 
-      // Закрываем WebSocket сервер
+      this.closeAllClientConnections();
+
+      if (this.pingInterval) {
+        clearInterval(this.pingInterval);
+        this.pingInterval = null;
+      }
+
+      if (this.tokenCleanupInterval) {
+        clearInterval(this.tokenCleanupInterval);
+        this.tokenCleanupInterval = null;
+      }
+
       if (this.wss) {
         this.wss.close((error) => {
           if (error) {
@@ -946,10 +1118,10 @@ class WebSocketServerInstance {
   }
 }
 
-// Глобальная переменная для доступа к серверу из обработчиков сигналов
+// ============== MAIN ==============
+
 let wsServerInstance: WebSocketServerInstance | null = null;
 
-// Основная функция
 async function main() {
   try {
     console.log(
@@ -971,65 +1143,7 @@ async function main() {
   }
 }
 
-// Обработка сигналов
-process.on("SIGINT", async () => {
-  console.log(
-    `\n🛑 [${new Date().toISOString()}] Получен сигнал SIGINT. Завершение работы...`
-  );
-  if (wsServerInstance) {
-    await wsServerInstance.shutdown();
-  }
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  console.log(
-    `\n🛑 [${new Date().toISOString()}] Получен сигнал SIGTERM. Завершение работы...`
-  );
-  if (wsServerInstance) {
-    await wsServerInstance.shutdown();
-  }
-  process.exit(0);
-});
-
-// Обработка необработанных ошибок
-process.on("uncaughtException", (error) => {
-  console.error(
-    `❌ [${new Date().toISOString()}] Необработанная ошибка:`,
-    error
-  );
-  if (wsServerInstance) {
-    wsServerInstance.shutdown().then(() => process.exit(1));
-  } else {
-    process.exit(1);
-  }
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error(
-    `❌ [${new Date().toISOString()}] Необработанный rejection:`,
-    reason
-  );
-  if (wsServerInstance) {
-    wsServerInstance.shutdown().then(() => process.exit(1));
-  } else {
-    process.exit(1);
-  }
-});
-
-// Обработка SIGHUP (закрытие терминала)
-process.on("SIGHUP", async () => {
-  console.log(
-    `\n🛑 [${new Date().toISOString()}] Получен сигнал SIGHUP. Завершение работы...`
-  );
-  if (wsServerInstance) {
-    await wsServerInstance.shutdown();
-  }
-  process.exit(0);
-});
-
-// Таймаут для завершения (максимум 10 секунд)
-let shutdownTimeout: NodeJS.Timeout | null = null;
+// ============== SIGNAL HANDLERS ==============
 
 async function gracefulShutdown(signal: string) {
   console.log(
@@ -1038,8 +1152,7 @@ async function gracefulShutdown(signal: string) {
 
   if (wsServerInstance) {
     try {
-      // Устанавливаем таймаут на завершение
-      shutdownTimeout = setTimeout(() => {
+      const shutdownTimeout = setTimeout(() => {
         console.error(
           `❌ [${new Date().toISOString()}] Таймаут завершения (10с), принудительное завершение...`
         );
@@ -1048,9 +1161,7 @@ async function gracefulShutdown(signal: string) {
 
       await wsServerInstance.shutdown();
 
-      if (shutdownTimeout) {
-        clearTimeout(shutdownTimeout);
-      }
+      clearTimeout(shutdownTimeout);
     } catch (error) {
       console.error(
         `❌ [${new Date().toISOString()}] Ошибка при завершении:`,
@@ -1063,10 +1174,25 @@ async function gracefulShutdown(signal: string) {
   process.exit(0);
 }
 
-// Переопределяем обработчики с таймаутом
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
+
+process.on("uncaughtException", (error) => {
+  console.error(
+    `❌ [${new Date().toISOString()}] Необработанная ошибка:`,
+    error
+  );
+  gracefulShutdown("UNCAUGHT_EXCEPTION");
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    `❌ [${new Date().toISOString()}] Необработанный rejection:`,
+    reason
+  );
+  gracefulShutdown("UNHANDLED_REJECTION");
+});
 
 // Запуск
 main().catch((error) => {

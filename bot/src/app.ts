@@ -1,84 +1,149 @@
-// Улучшенная версия app.ts без WebSocket (только HTTP и InstanceSystem)
 const http = require("http");
 const { baseConfig: config } = require("./config/config");
 const { getStateManager } = require("./core/StateManager");
 const { getInstanceSystem } = require("./instances/InstanceSystem");
 const { logError, logSuccess, logInfo, logWarning } = require("./core/logger");
 
-// Типы
-interface SystemMessage {
-  type: "system" | "balanceUpdate" | "error";
-  message?: string;
-  timestamp?: string;
-  data?: any;
-}
-
 interface ApiResponse {
   status?: string;
   error?: string;
   data?: any;
   timestamp?: string;
+  health?: any;
 }
 
-// Состояние приложения
 let instanceSystem: any = null;
 let httpServer: any = null;
+let isShuttingDown: boolean = false;
 
-// HTTP Server
+// ============== HTTP SERVER ==============
+
 const createHttpServer = (): any => {
   return http.createServer((req: any, res: any) => {
     try {
+      // CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      
       if (req.method === "GET" && req.url === "/api/status") {
-        const response: ApiResponse = { status: "DTrader-4 is running!" };
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response));
-      } else if (req.method === "GET" && req.url === "/api/health") {
-        const response: ApiResponse = {
-          status: "healthy",
-          timestamp: new Date().toISOString(),
+        const status = instanceSystem ? instanceSystem.getStatus() : { isRunning: false };
+        const response: ApiResponse = { 
+          status: "DTrader-4 Bot is running!",
+          data: status,
+          timestamp: new Date().toISOString()
         };
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response));
+        res.end(JSON.stringify(response, null, 2));
+      } else if (req.method === "GET" && req.url === "/api/health") {
+        const health = instanceSystem ? instanceSystem.getHealth() : {
+          stateManager: false,
+          websocket: false,
+          exchange: false,
+          lastBalanceUpdate: 0
+        };
+        
+        const isHealthy = health.stateManager && health.websocket;
+        
+        const response: ApiResponse = {
+          status: isHealthy ? "healthy" : "unhealthy",
+          health: health,
+          timestamp: new Date().toISOString()
+        };
+        
+        res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response, null, 2));
+      } else if (req.method === "GET" && req.url === "/api/balance") {
+        if (!instanceSystem) {
+          const response: ApiResponse = { 
+            error: "Instance system not initialized",
+            timestamp: new Date().toISOString()
+          };
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response));
+          return;
+        }
+        
+        instanceSystem.getCurrentBalance()
+          .then((balance: any) => {
+            const response: ApiResponse = { 
+              status: "success",
+              data: balance || [],
+              timestamp: new Date().toISOString()
+            };
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(response, null, 2));
+          })
+          .catch((error: Error) => {
+            const response: ApiResponse = { 
+              error: error.message,
+              timestamp: new Date().toISOString()
+            };
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(response));
+          });
       } else {
-        const response: ApiResponse = { error: "Not Found" };
+        const response: ApiResponse = { 
+          error: "Not Found",
+          timestamp: new Date().toISOString()
+        };
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify(response));
       }
     } catch (error) {
       logError("Ошибка обработки HTTP запроса", error);
-      const response: ApiResponse = { error: "Internal Server Error" };
+      const response: ApiResponse = { 
+        error: "Internal Server Error",
+        timestamp: new Date().toISOString()
+      };
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify(response));
     }
   });
 };
 
-// Graceful Shutdown
-const gracefulShutdown = async (signal: string): Promise<void> => {
-  if (config.isShuttingDown) return;
-  config.isShuttingDown = true;
+// ============== GRACEFUL SHUTDOWN ==============
 
-  logInfo(`Получен сигнал ${signal}. Завершение работы...`);
+const gracefulShutdown = async (signal: string): Promise<void> => {
+  if (isShuttingDown) {
+    logInfo('Завершение уже выполняется...');
+    return;
+  }
+  
+  isShuttingDown = true;
+  logInfo(`Получен сигнал ${signal}. Начало безопасного завершения...`);
 
   const shutdownTimeout = setTimeout(() => {
     logError("Таймаут ожидания", new Error("Shutdown timeout"));
     process.exit(1);
-  }, 5000);
+  }, 10000);
 
   try {
-    // Остановка Instance System
     if (instanceSystem) {
       logInfo("Остановка Instance System...");
       await instanceSystem.stop();
       logSuccess("Instance System остановлен");
     }
 
-    // Закрытие HTTP сервера
     if (httpServer) {
       logInfo("Закрытие HTTP сервера...");
-      httpServer.close(() => {
-        logSuccess("HTTP сервер остановлен");
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => {
+          logSuccess("HTTP сервер остановлен");
+          resolve();
+        });
       });
+    }
+
+    const stateManager = getStateManager();
+    if (stateManager && stateManager.isHealthy()) {
+      await stateManager.disconnect();
     }
 
     clearTimeout(shutdownTimeout);
@@ -86,41 +151,38 @@ const gracefulShutdown = async (signal: string): Promise<void> => {
     process.exit(0);
   } catch (error) {
     logError("Ошибка при завершении работы", error);
+    clearTimeout(shutdownTimeout);
     process.exit(1);
   }
 };
 
-// Основная функция
+// ============== MAIN ==============
+
 const main = async (): Promise<void> => {
   try {
-    // Инициализация сервера
     httpServer = createHttpServer();
 
-    // Настройка обработчиков сигналов
     process.on("SIGINT", () => gracefulShutdown("SIGINT"));
     process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
     process.on("SIGQUIT", () => gracefulShutdown("SIGQUIT"));
+    process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
 
-    // Обработка необработанных ошибок
     process.on("uncaughtException", (err: Error) => {
       logError("Необработанная ошибка", err);
-      gracefulShutdown("ERROR");
+      gracefulShutdown("UNCAUGHT_EXCEPTION");
     });
 
     process.on("unhandledRejection", (reason: unknown) => {
       logError("Необработанный rejection", reason);
-      gracefulShutdown("REJECTION");
+      gracefulShutdown("UNHANDLED_REJECTION");
     });
 
-    // Проверка конфигурации биржи
     if (config.exchange.enabled) {
       logInfo("Gate.io Exchange: Ключи API настроены");
 
-      // Инициализация Instance System
       instanceSystem = getInstanceSystem();
       await instanceSystem.start();
 
-      // Получение баланса
       const balance = await instanceSystem.getCurrentBalance();
       if (balance && balance.length > 0) {
         logInfo("Баланс получен:");
@@ -131,20 +193,22 @@ const main = async (): Promise<void> => {
         });
       }
     } else {
-      logInfo("Gate.io Exchange: Ключи API не настроены");
+      logWarning("Gate.io Exchange: Ключи API не настроены");
+      logInfo("Работа в режиме без биржи (только Redis и WebSocket)");
     }
 
-    // Запуск сервера
     httpServer.listen(config.SERVER_PORT, () => {
       logSuccess(`REST API запущен на http://localhost:${config.SERVER_PORT}`);
+      logInfo(`  - GET /api/status - Статус системы`);
+      logInfo(`  - GET /api/health - Health check`);
+      logInfo(`  - GET /api/balance - Текущий баланс`);
       logInfo("WebSocket сервер работает в инстансе ws-server");
       logInfo("Нажмите Ctrl+C для завершения");
     });
 
-    // Ожидание завершения
     await new Promise<void>((resolve) => {
       const checkShutdown = () => {
-        if (config.isShuttingDown) {
+        if (isShuttingDown) {
           resolve();
         } else {
           setImmediate(checkShutdown);
@@ -152,17 +216,12 @@ const main = async (): Promise<void> => {
       };
       setImmediate(checkShutdown);
     });
-
-    // Освобождение ресурсов
-    const stateManager = getStateManager();
-    await stateManager.disconnect();
   } catch (error) {
     logError("Фатальная ошибка при запуске", error);
     process.exit(1);
   }
 };
 
-// Запуск
 main().catch((error) => {
   logError("Фатальная ошибка", error);
   process.exit(1);
