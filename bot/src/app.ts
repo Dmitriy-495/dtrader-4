@@ -22,85 +22,229 @@ const createHttpServer = (): any => {
   return http.createServer((req: any, res: any) => {
     try {
       // CORS headers
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-      
-      if (req.method === 'OPTIONS') {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+      if (req.method === "OPTIONS") {
         res.writeHead(200);
         res.end();
         return;
       }
-      
+
       if (req.method === "GET" && req.url === "/api/status") {
-        const status = instanceSystem ? instanceSystem.getStatus() : { isRunning: false };
-        const response: ApiResponse = { 
+        const status = instanceSystem
+          ? instanceSystem.getStatus()
+          : { isRunning: false };
+        const response: ApiResponse = {
           status: "DTrader-4 Bot is running!",
           data: status,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         };
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(response, null, 2));
       } else if (req.method === "GET" && req.url === "/api/health") {
-        const health = instanceSystem ? instanceSystem.getHealth() : {
-          stateManager: false,
-          websocket: false,
-          exchange: false,
-          lastBalanceUpdate: 0
-        };
-        
+        const health = instanceSystem
+          ? instanceSystem.getHealth()
+          : {
+              stateManager: false,
+              websocket: false,
+              exchange: false,
+              lastBalanceUpdate: 0,
+            };
+
         const isHealthy = health.stateManager && health.websocket;
-        
+
         const response: ApiResponse = {
           status: isHealthy ? "healthy" : "unhealthy",
           health: health,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         };
-        
-        res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
+
+        res.writeHead(isHealthy ? 200 : 503, {
+          "Content-Type": "application/json",
+        });
         res.end(JSON.stringify(response, null, 2));
       } else if (req.method === "GET" && req.url === "/api/balance") {
         if (!instanceSystem) {
-          const response: ApiResponse = { 
+          const response: ApiResponse = {
             error: "Instance system not initialized",
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
           };
           res.writeHead(503, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
           return;
         }
-        
-        instanceSystem.getCurrentBalance()
+
+        instanceSystem
+          .getCurrentBalance()
           .then((balance: any) => {
-            const response: ApiResponse = { 
+            const response: ApiResponse = {
               status: "success",
               data: balance || [],
-              timestamp: new Date().toISOString()
+              timestamp: new Date().toISOString(),
             };
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(response, null, 2));
           })
           .catch((error: Error) => {
-            const response: ApiResponse = { 
+            const response: ApiResponse = {
               error: error.message,
-              timestamp: new Date().toISOString()
+              timestamp: new Date().toISOString(),
             };
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify(response));
           });
       } else {
-        const response: ApiResponse = { 
+        const response: ApiResponse = {
           error: "Not Found",
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         };
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify(response));
       }
+      // Патч для app.ts - добавить эти endpoints в createHttpServer()
+
+      // GET /api/orderbook/:pair - Получить order book для пары
+      if (req.method === "GET" && req.url?.startsWith("/api/orderbook/")) {
+        const pair = req.url.split("/api/orderbook/")[1];
+
+        if (!pair) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Pair not specified" }));
+          return;
+        }
+
+        const orderBook = instanceSystem?.getOrderBook(pair.toUpperCase());
+
+        if (!orderBook) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ error: "Order book not found or not subscribed" })
+          );
+          return;
+        }
+
+        const response = {
+          success: true,
+          data: orderBook,
+          timestamp: new Date().toISOString(),
+        };
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response, null, 2));
+      }
+
+      // GET /api/best/:pair - Получить best bid/ask для пары
+      else if (req.method === "GET" && req.url?.startsWith("/api/best/")) {
+        const pair = req.url.split("/api/best/")[1];
+
+        if (!pair) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Pair not specified" }));
+          return;
+        }
+
+        const bestBidAsk = instanceSystem?.getBestBidAsk(pair.toUpperCase());
+
+        if (!bestBidAsk) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Best bid/ask not found" }));
+          return;
+        }
+
+        const response = {
+          success: true,
+          data: bestBidAsk,
+          timestamp: new Date().toISOString(),
+        };
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response, null, 2));
+      }
+
+      // POST /api/orderbook/subscribe - Подписаться на пару
+      else if (
+        req.method === "POST" &&
+        req.url === "/api/orderbook/subscribe"
+      ) {
+        let body = "";
+
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+        });
+
+        req.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            const pair = data.pair;
+
+            if (!pair) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Pair not specified" }));
+              return;
+            }
+
+            instanceSystem?.subscribeToOrderBook(pair.toUpperCase());
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                success: true,
+                message: `Subscribed to ${pair}`,
+                timestamp: new Date().toISOString(),
+              })
+            );
+          } catch (error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+          }
+        });
+      }
+
+      // POST /api/orderbook/unsubscribe - Отписаться от пары
+      else if (
+        req.method === "POST" &&
+        req.url === "/api/orderbook/unsubscribe"
+      ) {
+        let body = "";
+
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+        });
+
+        req.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            const pair = data.pair;
+
+            if (!pair) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Pair not specified" }));
+              return;
+            }
+
+            instanceSystem?.unsubscribeFromOrderBook(pair.toUpperCase());
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                success: true,
+                message: `Unsubscribed from ${pair}`,
+                timestamp: new Date().toISOString(),
+              })
+            );
+          } catch (error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+          }
+        });
+      }
     } catch (error) {
       logError("Ошибка обработки HTTP запроса", error);
-      const response: ApiResponse = { 
+      const response: ApiResponse = {
         error: "Internal Server Error",
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       };
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify(response));
@@ -112,10 +256,10 @@ const createHttpServer = (): any => {
 
 const gracefulShutdown = async (signal: string): Promise<void> => {
   if (isShuttingDown) {
-    logInfo('Завершение уже выполняется...');
+    logInfo("Завершение уже выполняется...");
     return;
   }
-  
+
   isShuttingDown = true;
   logInfo(`Получен сигнал ${signal}. Начало безопасного завершения...`);
 

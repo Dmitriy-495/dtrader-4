@@ -4,8 +4,23 @@ import * as path from "path";
 
 const rootEnvPath = path.resolve(__dirname, "../../../.env");
 dotenv.config({ path: rootEnvPath });
+console.log(rootEnvPath);
 
 console.log("📁 Загрузка конфигурации из:", rootEnvPath);
+if (!process.env.GATEIO_API_KEY || !process.env.GATEIO_API_SECRET) {
+  console.log(
+    "⚠️  .env файл не найден или не содержит API ключей, используются значения по умолчанию"
+  );
+}
+
+console.log(
+  "🔑 GATEIO_API_KEY:",
+  process.env.GATEIO_API_KEY ? "✅ Настроен" : "❌ Не настроен"
+);
+console.log(
+  "🔑 GATEIO_API_SECRET:",
+  process.env.GATEIO_API_SECRET ? "✅ Настроен" : "❌ Не настроен"
+);
 
 export interface ExchangeConfig {
   apiKey?: string;
@@ -46,6 +61,7 @@ export interface BaseConfig {
   orderBook: OrderBookConfig;
 }
 
+// Парсинг торговых пар из env
 function parseTradingPairs(pairsString?: string): TradingPair[] {
   if (!pairsString) {
     return [];
@@ -88,8 +104,7 @@ export const baseConfig: BaseConfig = {
   },
 };
 
-console.log("🔑 GATEIO_API_KEY:", baseConfig.exchange.apiKey ? "✅ Настроен" : "❌ Не настроен");
-console.log("🔑 GATEIO_API_SECRET:", baseConfig.exchange.secret ? "✅ Настроен" : "❌ Не настроен");
+// Логирование конфигурации торговых пар
 console.log("📊 Торговые пары:");
 baseConfig.orderBook.pairs.forEach((pair) => {
   console.log(`   ${pair.symbol} (${pair.base}/${pair.quote})`);
