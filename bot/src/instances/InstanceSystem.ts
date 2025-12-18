@@ -92,10 +92,10 @@ export class InstanceSystem {
           depth: config.orderBook.depth || 20,
           updateSpeed: config.orderBook.updateSpeed || '100ms',
           stateManager: this.stateManager,
-          onOrderBookUpdate: (update) => {
+          onOrderBookUpdate: (update: any) => {
             logInfo(`Order Book update: ${update.contract}`);
           },
-          onBestBidAsk: (data) => {
+          onBestBidAsk: (data: any) => {
             logInfo(`Best Bid/Ask ${data.contract}: ${data.bestBid?.price}/${data.bestAsk?.price} (spread: ${data.spreadPercent.toFixed(4)}%)`);
           }
         });

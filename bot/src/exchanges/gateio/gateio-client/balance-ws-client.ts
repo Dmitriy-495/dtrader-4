@@ -1,7 +1,5 @@
 const { WebSocket } = require('ws');
 import { GateIOWsSignature } from '../crypto/signature-ws';
-import { baseConfig as config } from '../../../config/config';
-
 interface BalanceUpdate {
   currency: string;
   available: string;

@@ -4,10 +4,10 @@ const { getStateManager } = require("./core/StateManager");
 const { getInstanceSystem } = require("./instances/InstanceSystem");
 const { getOrderBook } = require("./exchanges/gateio/endpoints/getOrderBook");
 const { getBestBidAsk } = require("./exchanges/gateio/endpoints/getBestBidAsk");
-const { subscribeOrderBook, unsubscribeOrderBook } = require("./exchanges/gateio/endpoints/subscribeOrderBook");
-const { getOrderBook } = require("./exchanges/gateio/endpoints/getOrderBook");
-const { getBestBidAsk } = require("./exchanges/gateio/endpoints/getBestBidAsk");
-const { subscribeOrderBook, unsubscribeOrderBook } = require("./exchanges/gateio/endpoints/subscribeOrderBook");
+const {
+  subscribeOrderBook,
+  unsubscribeOrderBook,
+} = require("./exchanges/gateio/endpoints/subscribeOrderBook");
 const { logError, logSuccess, logInfo, logWarning } = require("./core/logger");
 
 interface ApiResponse {
@@ -25,7 +25,7 @@ let isShuttingDown: boolean = false;
 // ============== HTTP SERVER ==============
 
 const createHttpServer = (): any => {
-  return http.createServer((req: any, res: any) => {
+  return http.createServer(async (req: any, res: any) => {
     try {
       // CORS headers
       res.setHeader("Access-Control-Allow-Origin", "*");
@@ -49,7 +49,10 @@ const createHttpServer = (): any => {
         };
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(response, null, 2));
-      } else if (req.method === "GET" && req.url === "/api/health") {
+        return;
+      }
+
+      if (req.method === "GET" && req.url === "/api/health") {
         const health = instanceSystem
           ? instanceSystem.getHealth()
           : {
@@ -71,7 +74,10 @@ const createHttpServer = (): any => {
           "Content-Type": "application/json",
         });
         res.end(JSON.stringify(response, null, 2));
-      } else if (req.method === "GET" && req.url === "/api/balance") {
+        return;
+      }
+
+      if (req.method === "GET" && req.url === "/api/balance") {
         if (!instanceSystem) {
           const response: ApiResponse = {
             error: "Instance system not initialized",
@@ -82,34 +88,25 @@ const createHttpServer = (): any => {
           return;
         }
 
-        instanceSystem
-          .getCurrentBalance()
-          .then((balance: any) => {
-            const response: ApiResponse = {
-              status: "success",
-              data: balance || [],
-              timestamp: new Date().toISOString(),
-            };
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response, null, 2));
-          })
-          .catch((error: Error) => {
-            const response: ApiResponse = {
-              error: error.message,
-              timestamp: new Date().toISOString(),
-            };
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response));
-          });
-      } else {
-        const response: ApiResponse = {
-          error: "Not Found",
-          timestamp: new Date().toISOString(),
-        };
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response));
+        try {
+          const balance = await instanceSystem.getCurrentBalance();
+          const response: ApiResponse = {
+            status: "success",
+            data: balance || [],
+            timestamp: new Date().toISOString(),
+          };
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response, null, 2));
+        } catch (error: any) {
+          const response: ApiResponse = {
+            error: error.message,
+            timestamp: new Date().toISOString(),
+          };
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response));
+        }
+        return;
       }
-      // Патч для app.ts - добавить эти endpoints в createHttpServer()
 
       // GET /api/orderbook/:pair - Получить order book для пары
       if (req.method === "GET" && req.url?.startsWith("/api/orderbook/")) {
@@ -119,73 +116,34 @@ const createHttpServer = (): any => {
           res.end(JSON.stringify({ error: "Pair not specified" }));
           return;
         }
+
         const result = await getOrderBook(pair);
-        res.writeHead(result.success ? 200 : 404, { "Content-Type": "application/json" });
+        res.writeHead(result.success ? 200 : 404, {
+          "Content-Type": "application/json",
+        });
         res.end(JSON.stringify(result, null, 2));
-      }
-          res.end(JSON.stringify({ error: "Pair not specified" }));
-          return;
-        }
-
-        const orderBook = instanceSystem?.getOrderBook(pair.toUpperCase());
-
-        if (!orderBook) {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ error: "Order book not found or not subscribed" })
-          );
-          return;
-        }
-
-        const response = {
-          success: true,
-          data: orderBook,
-          timestamp: new Date().toISOString(),
-        };
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response, null, 2));
+        return;
       }
 
       // GET /api/best/:pair - Получить best bid/ask для пары
-      else if (req.method === "GET" && req.url?.startsWith("/api/best/")) {
+      if (req.method === "GET" && req.url?.startsWith("/api/best/")) {
         const pair = req.url.split("/api/best/")[1];
         if (!pair) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Pair not specified" }));
           return;
         }
+
         const result = await getBestBidAsk(pair);
-        res.writeHead(result.success ? 200 : 404, { "Content-Type": "application/json" });
+        res.writeHead(result.success ? 200 : 404, {
+          "Content-Type": "application/json",
+        });
         res.end(JSON.stringify(result, null, 2));
-      }
-          res.end(JSON.stringify({ error: "Pair not specified" }));
-          return;
-        }
-
-        const bestBidAsk = instanceSystem?.getBestBidAsk(pair.toUpperCase());
-
-        if (!bestBidAsk) {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Best bid/ask not found" }));
-          return;
-        }
-
-        const response = {
-          success: true,
-          data: bestBidAsk,
-          timestamp: new Date().toISOString(),
-        };
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response, null, 2));
+        return;
       }
 
       // POST /api/orderbook/subscribe - Подписаться на пару
-      else if (
-        req.method === "POST" &&
-        req.url === "/api/orderbook/subscribe"
-      ) {
+      if (req.method === "POST" && req.url === "/api/orderbook/subscribe") {
         let body = "";
 
         req.on("data", (chunk: any) => {
@@ -218,13 +176,11 @@ const createHttpServer = (): any => {
             res.end(JSON.stringify({ error: "Invalid JSON" }));
           }
         });
+        return;
       }
 
       // POST /api/orderbook/unsubscribe - Отписаться от пары
-      else if (
-        req.method === "POST" &&
-        req.url === "/api/orderbook/unsubscribe"
-      ) {
+      if (req.method === "POST" && req.url === "/api/orderbook/unsubscribe") {
         let body = "";
 
         req.on("data", (chunk: any) => {
@@ -257,7 +213,16 @@ const createHttpServer = (): any => {
             res.end(JSON.stringify({ error: "Invalid JSON" }));
           }
         });
+        return;
       }
+
+      // 404 Not Found
+      const response: ApiResponse = {
+        error: "Not Found",
+        timestamp: new Date().toISOString(),
+      };
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(response));
     } catch (error) {
       logError("Ошибка обработки HTTP запроса", error);
       const response: ApiResponse = {
@@ -364,6 +329,10 @@ const main = async (): Promise<void> => {
       logInfo(`  - GET /api/status - Статус системы`);
       logInfo(`  - GET /api/health - Health check`);
       logInfo(`  - GET /api/balance - Текущий баланс`);
+      logInfo(`  - GET /api/orderbook/:pair - Order book для пары`);
+      logInfo(`  - GET /api/best/:pair - Best bid/ask для пары`);
+      logInfo(`  - POST /api/orderbook/subscribe - Подписка на пару`);
+      logInfo(`  - POST /api/orderbook/unsubscribe - Отписка от пары`);
       logInfo("WebSocket сервер работает в инстансе ws-server");
       logInfo("Нажмите Ctrl+C для завершения");
     });
