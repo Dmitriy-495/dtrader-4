@@ -17,6 +17,7 @@ export class StateManager {
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private connectionTimeout: number = 5000;
+  private operationTimeout: number = 5000;
 
   constructor() {
     if (!config.redis) {
@@ -28,13 +29,12 @@ export class StateManager {
       socket: {
         reconnectStrategy: (retries) => {
           if (retries > this.maxReconnectAttempts) {
-            logError(
-              "Redis reconnect attempts exceeded",
-              new Error("Max retries")
-            );
+            logError("Redis reconnect attempts exceeded", new Error("Max retries"));
             return new Error("Max reconnect attempts exceeded");
           }
-          return Math.min(retries * 100, 5000);
+          const delay = Math.min(retries * 100, 5000);
+          logWarning(`Redis reconnecting (attempt ${retries}/${this.maxReconnectAttempts}) in ${delay}ms`);
+          return delay;
         },
         connectTimeout: this.connectionTimeout,
       },
@@ -78,9 +78,7 @@ export class StateManager {
 
     this.redisClient.on("reconnecting", () => {
       this.reconnectAttempts++;
-      logWarning(
-        `Redis reconnecting (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`
-      );
+      logWarning(`Redis reconnecting (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
     });
   }
 
@@ -109,11 +107,14 @@ export class StateManager {
     }
   }
 
+  // КРИТИЧЕСКАЯ ФУНКЦИЯ: проверка соединения перед операциями
   private async ensureConnected(): Promise<void> {
-    if (!this.redisClient.isOpen) {
-      throw new Error("Redis connection is not active");
+    // Проверяем статус клиента
+    if (!this.redisClient.isReady) {
+      throw new Error("Redis client is not ready");
     }
 
+    // Проверяем, что соединение живо через PING с timeout
     try {
       await Promise.race([
         this.redisClient.ping(),
@@ -123,12 +124,13 @@ export class StateManager {
       ]);
     } catch (error) {
       this.isConnected = false;
-      // throw new Error(`Redis health check failed: ${error.message}`);
+      throw new Error(`Redis health check failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   async setCurrentBalance(balance: BalanceState[]): Promise<void> {
     try {
+      // КРИТИЧЕСКАЯ ПРОВЕРКА перед операцией
       await this.ensureConnected();
 
       logInfo("Сохранение баланса в Redis...");
@@ -137,23 +139,30 @@ export class StateManager {
       const balanceString = JSON.stringify(balance);
       logInfo(`Сериализовано в JSON: ${balanceString.length} символов`);
 
+      // Операция с timeout
       await Promise.race([
         this.redisClient.set("currentBalance", balanceString),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Set timeout")), 5000)
+          setTimeout(() => reject(new Error("Set timeout")), this.operationTimeout)
         ),
       ]);
 
       logSuccess("Успешно записано в Redis");
 
-      await this.pubClient.publish(
-        "stateUpdate",
-        JSON.stringify({
-          type: "balanceUpdated",
-          data: balance,
-          timestamp: Date.now(),
-        })
-      );
+      // Публикация с timeout
+      await Promise.race([
+        this.pubClient.publish(
+          "stateUpdate",
+          JSON.stringify({
+            type: "balanceUpdated",
+            data: balance,
+            timestamp: Date.now(),
+          })
+        ),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Publish timeout")), this.operationTimeout)
+        ),
+      ]);
 
       logInfo("Опубликовано событие обновления баланса");
       logSuccess("Баланс успешно сохранен в Redis");
@@ -165,14 +174,16 @@ export class StateManager {
 
   async getCurrentBalance(): Promise<BalanceState[] | null> {
     try {
+      // КРИТИЧЕСКАЯ ПРОВЕРКА перед операцией
       await this.ensureConnected();
 
       logInfo("Чтение баланса из Redis...");
 
+      // Операция с timeout
       const balance = await Promise.race([
         this.redisClient.get("currentBalance"),
         new Promise<string | null>((_, reject) =>
-          setTimeout(() => reject(new Error("Get timeout")), 5000)
+          setTimeout(() => reject(new Error("Get timeout")), this.operationTimeout)
         ),
       ]);
 
@@ -192,9 +203,7 @@ export class StateManager {
     }
   }
 
-  async subscribeToUpdates(
-    callback: (channel: string, message: string) => void
-  ): Promise<void> {
+  async subscribeToUpdates(callback: (channel: string, message: string) => void): Promise<void> {
     try {
       await this.subClient.subscribe("stateUpdate", callback);
       logInfo("Подписка на обновления состояния активна");
@@ -204,8 +213,9 @@ export class StateManager {
     }
   }
 
+  // Health check метод для мониторинга
   isHealthy(): boolean {
-    return this.isConnected && this.redisClient.isOpen;
+    return this.isConnected && this.redisClient.isReady;
   }
 
   async disconnect(): Promise<void> {

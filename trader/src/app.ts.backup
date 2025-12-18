@@ -1,10 +1,20 @@
 // DTrader Trader Instance - Instance C
+// Исполнитель торговых операций
+
 import { createClient, RedisClientType } from 'redis';
 import dotenv from 'dotenv';
 import { config } from './config/config';
-import { BalanceChecker } from './core/BalanceChecker';
 
+// Загружаем переменные окружения
 dotenv.config();
+
+// Типы данных
+interface BalanceState {
+  currency: string;
+  available: string;
+  locked: string;
+  total: string;
+}
 
 interface TradeSignal {
   id: string;
@@ -26,26 +36,24 @@ interface OrderExecution {
   executedPrice?: number;
   executedAmount?: number;
   timestamp: number;
-  rejectReason?: string;
 }
 
 class TraderInstance {
   private redisClient: RedisClientType;
   private pubClient: RedisClientType;
   private subClient: RedisClientType;
-  private balanceChecker: BalanceChecker;
   private isRunning: boolean;
   private executedOrders: OrderExecution[];
   
   constructor() {
     this.isRunning = false;
     this.executedOrders = [];
-    this.balanceChecker = new BalanceChecker();
     
     if (!config.redis) {
       throw new Error('Redis configuration is required for Trader Instance');
     }
     
+    // Инициализируем Redis клиенты
     this.redisClient = createClient({
       url: `redis://${config.redis.host}:${config.redis.port}`
     });
@@ -64,14 +72,15 @@ class TraderInstance {
       await Promise.all([
         this.redisClient.connect(),
         this.pubClient.connect(),
-        this.subClient.connect(),
-        this.balanceChecker.initialize()
+        this.subClient.connect()
       ]);
       
       console.log('✅ Trader Instance C инициализирован');
       console.log(`   🔌 Подключено к Redis: redis://${config.redis.host}:${config.redis.port}`);
       
+      // Подписываемся на торговые сигналы
       await this.subscribeToTradeSignals();
+      
       this.isRunning = true;
       
     } catch (error) {
@@ -89,6 +98,7 @@ class TraderInstance {
       });
       
       console.log('✅ Подписка на канал trading:signals активна');
+      
     } catch (error) {
       console.error('❌ Ошибка подписки на торговые сигналы:', error);
       throw error;
@@ -98,48 +108,16 @@ class TraderInstance {
   private async handleTradeSignal(message: string) {
     try {
       console.log('📩 Получен торговый сигнал:', message);
+      
       const signal: TradeSignal = JSON.parse(message);
-      
-      // 🔴 КРИТИЧЕСКАЯ ПРОВЕРКА: Проверяем баланс перед исполнением
-      const [base, quote] = signal.symbol.split('_');
-      const currency = signal.type === 'buy' ? quote : base;
-      const requiredAmount = signal.type === 'buy' 
-        ? signal.price * signal.amount 
-        : signal.amount;
-      
-      const balanceCheck = await this.balanceChecker.checkBalance(
-        currency,
-        requiredAmount
-      );
-      
-      if (!balanceCheck.sufficient) {
-        console.error(`❌ Недостаточно средств для ордера ${signal.id}:`);
-        console.error(`   Требуется: ${balanceCheck.required} ${currency}`);
-        console.error(`   Доступно: ${balanceCheck.available} ${currency}`);
-        
-        // Создаем отклоненный ордер
-        const execution: OrderExecution = {
-          id: `ORDER-${Date.now()}-REJECTED`,
-          signalId: signal.id,
-          symbol: signal.symbol,
-          type: signal.type,
-          price: signal.price,
-          amount: signal.amount,
-          status: 'failed',
-          timestamp: Date.now(),
-          rejectReason: balanceCheck.message
-        };
-        
-        this.executedOrders.push(execution);
-        await this.publishExecutionResult(execution);
-        return;
-      }
-      
-      console.log('✅ Баланс достаточен, выполняем ордер');
       
       // Исполняем ордер
       const execution = await this.executeOrder(signal);
+      
+      // Сохраняем результат исполнения
       this.executedOrders.push(execution);
+      
+      // Публикуем результат
       await this.publishExecutionResult(execution);
       
     } catch (error) {
@@ -151,6 +129,7 @@ class TraderInstance {
     try {
       console.log(`🔄 Исполнение ордера: ${signal.type.toUpperCase()} ${signal.amount} ${signal.symbol} @ ${signal.price}`);
       
+      // Симулируем исполнение (в реальности здесь будет вызов API биржи)
       const executedPrice = this.simulateExecutionPrice(signal.price, signal.type);
       const executedAmount = this.simulateExecutionAmount(signal.amount);
       
@@ -183,18 +162,19 @@ class TraderInstance {
         price: signal.price,
         amount: signal.amount,
         status: 'failed',
-        timestamp: Date.now(),
-        rejectReason: error instanceof Error ? error.message : 'Unknown error'
+        timestamp: Date.now()
       };
     }
   }
   
   private simulateExecutionPrice(basePrice: number, type: 'buy' | 'sell'): number {
-    const spread = 0.001;
+    // Добавляем небольшой спред
+    const spread = 0.001; // 0.1%
     return type === 'buy' ? basePrice * (1 + spread) : basePrice * (1 - spread);
   }
   
   private simulateExecutionAmount(requestedAmount: number): number {
+    // 95-100% исполнение
     const executionRatio = 0.95 + Math.random() * 0.05;
     return requestedAmount * executionRatio;
   }
@@ -214,22 +194,35 @@ class TraderInstance {
     }
   }
   
+  async getExecutionHistory(): Promise<OrderExecution[]> {
+    return this.executedOrders;
+  }
+  
+  async getStatus() {
+    return {
+      isRunning: this.isRunning,
+      timestamp: Date.now(),
+      totalOrdersExecuted: this.executedOrders.length
+    };
+  }
+  
   async disconnect() {
     try {
       await Promise.all([
         this.redisClient.quit(),
         this.pubClient.quit(),
-        this.subClient.quit(),
-        this.balanceChecker.disconnect()
+        this.subClient.quit()
       ]);
       
       console.log('🔌 Trader Instance соединения закрыты');
+      
     } catch (error) {
       console.error('❌ Ошибка при закрытии соединений:', error);
     }
   }
 }
 
+// Основная функция
 async function main() {
   try {
     console.log('🚀 Запуск Trader Instance C...');
@@ -246,6 +239,7 @@ async function main() {
   }
 }
 
+// Обработка сигналов для безопасного завершения
 process.on('SIGINT', async () => {
   console.log('\n🛑 Получен сигнал SIGINT. Завершение работы...');
   process.exit(0);
@@ -256,6 +250,7 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
+// Запуск
 main().catch(error => {
   console.error('❌ Фатальная ошибка:', error);
   process.exit(1);

@@ -1,6 +1,7 @@
 import { getStateManager, BalanceState } from "../core/StateManager";
 import { logInfo, logSuccess, logError, logWarning } from "../core/logger";
 import { GateioWebSocket } from "../exchanges/gateio/gateio-client/ws-client";
+import { OrderBookWebSocket, OrderBookSnapshot, BestBidAsk } from "../exchanges/gateio/gateio-client/orderbook-ws-client";
 import { GateIOBalance } from "../exchanges/gateio/endpoints/getBalance";
 import { baseConfig as config } from "../config/config";
 
@@ -8,6 +9,7 @@ interface InstanceHealth {
   stateManager: boolean;
   websocket: boolean;
   exchange: boolean;
+  orderBook: boolean;
   lastBalanceUpdate: number;
 }
 
@@ -15,6 +17,7 @@ export class InstanceSystem {
   private stateManager: ReturnType<typeof getStateManager>;
   private isRunning: boolean;
   private wsClient?: GateioWebSocket;
+  private orderBookWs?: OrderBookWebSocket;
   private gateioClient?: GateIOBalance;
   private balanceUpdateInterval?: NodeJS.Timeout;
   private healthCheckInterval?: NodeJS.Timeout;
@@ -27,6 +30,7 @@ export class InstanceSystem {
       stateManager: false,
       websocket: false,
       exchange: false,
+      orderBook: false,
       lastBalanceUpdate: 0,
     };
 
@@ -60,7 +64,6 @@ export class InstanceSystem {
           retryDelay: 1000,
         });
 
-        // Проверяем доступность API
         const testBalance = await this.gateioClient.getSpotBalance();
         if (testBalance.success) {
           this.health.exchange = true;
@@ -81,6 +84,27 @@ export class InstanceSystem {
       this.wsClient.connect();
       this.health.websocket = true;
 
+      // Инициализируем Order Book WebSocket
+      if (config.orderBook && config.orderBook.pairs.length > 0) {
+        logInfo("Инициализация Order Book WebSocket...");
+        
+        this.orderBookWs = new OrderBookWebSocket({
+          depth: config.orderBook.depth || 20,
+          updateSpeed: config.orderBook.updateSpeed || '100ms',
+          stateManager: this.stateManager,
+          onOrderBookUpdate: (update) => {
+            logInfo(`Order Book update: ${update.contract}`);
+          },
+          onBestBidAsk: (data) => {
+            logInfo(`Best Bid/Ask ${data.contract}: ${data.bestBid?.price}/${data.bestAsk?.price} (spread: ${data.spreadPercent.toFixed(4)}%)`);
+          }
+        });
+        
+        this.orderBookWs.connect();
+        this.health.orderBook = true;
+        logSuccess("Order Book WebSocket инициализирован");
+      }
+
       // Запускаем периодическое обновление баланса
       this.startBalanceUpdates();
 
@@ -100,7 +124,6 @@ export class InstanceSystem {
   private startBalanceUpdates() {
     if (!this.gateioClient) return;
 
-    // Обновляем баланс каждые 30 секунд
     this.balanceUpdateInterval = setInterval(async () => {
       try {
         const balance = await this.getCurrentBalance();
@@ -120,10 +143,7 @@ export class InstanceSystem {
       const health = this.getHealth();
 
       if (!health.stateManager) {
-        logError(
-          "Health Check: StateManager неисправен",
-          new Error("Redis connection lost")
-        );
+        logError("Health Check: StateManager неисправен", new Error("Redis connection lost"));
       }
 
       if (!health.websocket) {
@@ -133,14 +153,14 @@ export class InstanceSystem {
       if (!health.exchange) {
         logWarning("Health Check: Gate.io API недоступен");
       }
+      
+      if (!health.orderBook && config.orderBook?.pairs.length > 0) {
+        logWarning("Health Check: Order Book WebSocket не подключен");
+      }
 
       const timeSinceLastUpdate = Date.now() - health.lastBalanceUpdate;
       if (timeSinceLastUpdate > 60000) {
-        logWarning(
-          `Health Check: Баланс не обновлялся ${Math.floor(
-            timeSinceLastUpdate / 1000
-          )}с`
-        );
+        logWarning(`Health Check: Баланс не обновлялся ${Math.floor(timeSinceLastUpdate / 1000)}с`);
       }
     }, 60000);
 
@@ -167,6 +187,10 @@ export class InstanceSystem {
       if (this.wsClient && this.wsClient.isConnected()) {
         this.wsClient.disconnect();
       }
+      
+      if (this.orderBookWs && this.orderBookWs.isConnected()) {
+        this.orderBookWs.disconnect();
+      }
 
       await this.stateManager.disconnect();
 
@@ -175,6 +199,7 @@ export class InstanceSystem {
         stateManager: false,
         websocket: false,
         exchange: false,
+        orderBook: false,
         lastBalanceUpdate: 0,
       };
 
@@ -200,6 +225,7 @@ export class InstanceSystem {
       stateManager: this.stateManager.isHealthy(),
       websocket: this.wsClient?.isConnected() || false,
       exchange: this.health.exchange,
+      orderBook: this.orderBookWs?.isConnected() || false,
       lastBalanceUpdate: this.health.lastBalanceUpdate,
     };
   }
@@ -224,6 +250,62 @@ export class InstanceSystem {
       logError("Ошибка получения текущего баланса", error);
       return null;
     }
+  }
+  
+  // ============== ORDER BOOK МЕТОДЫ ==============
+  
+  /**
+   * Получить order book для конкретной пары
+   */
+  getOrderBook(pair: string): OrderBookSnapshot | null {
+    if (!this.orderBookWs) {
+      logWarning("Order Book WebSocket не инициализирован");
+      return null;
+    }
+    return this.orderBookWs.getOrderBook(pair);
+  }
+  
+  /**
+   * Получить best bid/ask для пары
+   */
+  getBestBidAsk(pair: string): BestBidAsk | null {
+    if (!this.orderBookWs) {
+      logWarning("Order Book WebSocket не инициализирован");
+      return null;
+    }
+    return this.orderBookWs.getBestBidAsk(pair);
+  }
+  
+  /**
+   * Подписаться на order book конкретной пары
+   */
+  subscribeToOrderBook(pair: string): void {
+    if (!this.orderBookWs) {
+      logWarning("Order Book WebSocket не инициализирован");
+      return;
+    }
+    this.orderBookWs.subscribeToPair(pair);
+  }
+  
+  /**
+   * Отписаться от order book пары
+   */
+  unsubscribeFromOrderBook(pair: string): void {
+    if (!this.orderBookWs) {
+      logWarning("Order Book WebSocket не инициализирован");
+      return;
+    }
+    this.orderBookWs.unsubscribeFromPair(pair);
+  }
+  
+  /**
+   * Получить список подписанных пар
+   */
+  getSubscribedPairs(): string[] {
+    if (!this.orderBookWs) {
+      return [];
+    }
+    return this.orderBookWs.getSubscribedPairs();
   }
 }
 

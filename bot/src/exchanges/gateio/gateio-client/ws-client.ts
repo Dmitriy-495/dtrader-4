@@ -43,7 +43,7 @@ export class GateioWebSocket {
       this.socket = new WebSocket(this.wsUrl);
       
       this.socket.on('open', () => {
-        console.log('✅ Gate.io WS: Соединение установлено успешно');
+        console.log('✅ Gate.io WS: Соединение установлено');
         this.connected = true;
         this.reconnectAttempts = 0;
         this.startPingPong();
@@ -76,7 +76,7 @@ export class GateioWebSocket {
       const message = JSON.parse(data);
 
       if (message && message.result === 'pong') {
-        console.log('🏓 Gate.io WS: Получен ответ от сервера (соединение активно)');
+        console.log('🏓 Gate.io WS: Получен pong (соединение активно)');
         this.resetPingTimeout();
         
         if (this.stateManager) {
@@ -88,7 +88,7 @@ export class GateioWebSocket {
           };
           
           this.stateManager.pubClient.publish('exchange:pong', JSON.stringify(pongData));
-          console.log('📡 Gate.io WS: Опубликовано pong в Redis для ws-server');
+          console.log('📡 Gate.io WS: Опубликовано pong в Redis');
         }
         
         return;
@@ -132,7 +132,7 @@ export class GateioWebSocket {
       this.sendPing();
     }, this.pingIntervalMs);
     
-    console.log(`⏱️ Gate.io WS: Запущен механизм ping-pong (интервал: ${this.pingIntervalMs}ms, таймаут: ${this.pingTimeoutMs}ms)`);
+    console.log(`⏱️ Gate.io WS: Запущен механизм ping-pong (интервал: ${this.pingIntervalMs}ms)`);
   }
   
   private stopPingPong(): void {
@@ -149,7 +149,7 @@ export class GateioWebSocket {
   
   private setupPingTimeout(): void {
     this.pingTimeout = setTimeout(() => {
-      console.error('❌ Gate.io WS: Таймаут ожидания pong - соединение не отвечает');
+      console.error('❌ Gate.io WS: Таймаут ожидания pong');
       this.handleConnectionError();
     }, this.pingTimeoutMs);
   }
@@ -161,6 +161,7 @@ export class GateioWebSocket {
     }
   }
   
+  // КРИТИЧЕСКАЯ ФУНКЦИЯ: reconnect логика
   private handleConnectionError(): void {
     if (this.isShuttingDown) {
       console.log('⚠️  Gate.io WS: Завершение работы, переподключение отменено');
@@ -171,7 +172,7 @@ export class GateioWebSocket {
     this.stopPingPong();
     
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error(`❌ Gate.io WS: Превышено максимальное количество попыток переподключения (${this.maxReconnectAttempts})`);
+      console.error(`❌ Gate.io WS: Превышено максимальное количество попыток (${this.maxReconnectAttempts})`);
       return;
     }
     
@@ -181,7 +182,7 @@ export class GateioWebSocket {
       60000
     );
     
-    console.log(`🔄 Gate.io WS: Попытка переподключения ${this.reconnectAttempts}/${this.maxReconnectAttempts} через ${delay}ms`);
+    console.log(`🔄 Gate.io WS: Переподключение ${this.reconnectAttempts}/${this.maxReconnectAttempts} через ${delay}ms`);
     
     setTimeout(() => {
       this.connect();
@@ -209,7 +210,7 @@ export class GateioWebSocket {
         this.socket.close();
         console.log('🔌 Gate.io WS: Соединение закрыто');
       } catch (error) {
-        console.error('❌ Gate.io WS: Ошибка при закрытии соединения:', error);
+        console.error('❌ Gate.io WS: Ошибка при закрытии:', error);
       }
     }
     

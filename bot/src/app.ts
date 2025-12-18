@@ -2,6 +2,12 @@ const http = require("http");
 const { baseConfig: config } = require("./config/config");
 const { getStateManager } = require("./core/StateManager");
 const { getInstanceSystem } = require("./instances/InstanceSystem");
+const { getOrderBook } = require("./exchanges/gateio/endpoints/getOrderBook");
+const { getBestBidAsk } = require("./exchanges/gateio/endpoints/getBestBidAsk");
+const { subscribeOrderBook, unsubscribeOrderBook } = require("./exchanges/gateio/endpoints/subscribeOrderBook");
+const { getOrderBook } = require("./exchanges/gateio/endpoints/getOrderBook");
+const { getBestBidAsk } = require("./exchanges/gateio/endpoints/getBestBidAsk");
+const { subscribeOrderBook, unsubscribeOrderBook } = require("./exchanges/gateio/endpoints/subscribeOrderBook");
 const { logError, logSuccess, logInfo, logWarning } = require("./core/logger");
 
 interface ApiResponse {
@@ -108,9 +114,15 @@ const createHttpServer = (): any => {
       // GET /api/orderbook/:pair - Получить order book для пары
       if (req.method === "GET" && req.url?.startsWith("/api/orderbook/")) {
         const pair = req.url.split("/api/orderbook/")[1];
-
         if (!pair) {
           res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Pair not specified" }));
+          return;
+        }
+        const result = await getOrderBook(pair);
+        res.writeHead(result.success ? 200 : 404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result, null, 2));
+      }
           res.end(JSON.stringify({ error: "Pair not specified" }));
           return;
         }
@@ -138,9 +150,15 @@ const createHttpServer = (): any => {
       // GET /api/best/:pair - Получить best bid/ask для пары
       else if (req.method === "GET" && req.url?.startsWith("/api/best/")) {
         const pair = req.url.split("/api/best/")[1];
-
         if (!pair) {
           res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Pair not specified" }));
+          return;
+        }
+        const result = await getBestBidAsk(pair);
+        res.writeHead(result.success ? 200 : 404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result, null, 2));
+      }
           res.end(JSON.stringify({ error: "Pair not specified" }));
           return;
         }
@@ -170,7 +188,7 @@ const createHttpServer = (): any => {
       ) {
         let body = "";
 
-        req.on("data", (chunk) => {
+        req.on("data", (chunk: any) => {
           body += chunk.toString();
         });
 
@@ -209,7 +227,7 @@ const createHttpServer = (): any => {
       ) {
         let body = "";
 
-        req.on("data", (chunk) => {
+        req.on("data", (chunk: any) => {
           body += chunk.toString();
         });
 
