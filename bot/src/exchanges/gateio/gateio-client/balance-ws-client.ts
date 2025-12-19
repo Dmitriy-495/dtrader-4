@@ -24,7 +24,7 @@ export class BalanceWebSocket extends BaseGateIOWebSocket {
   private apiSecret: string;
   private wsSignature: GateIOWsSignature;
   private onBalanceUpdate?: (balances: BalanceUpdate[]) => void;
-  private isAuthenticated: boolean = false;
+  private authenticated: boolean = false;  // Переименовали для избежания конфликта
 
   constructor(config: BalanceWsConfig) {
     // Вызываем конструктор базового класса
@@ -66,7 +66,7 @@ export class BalanceWebSocket extends BaseGateIOWebSocket {
    * При открытии соединения - запускаем аутентификацию
    */
   protected onOpen(): void {
-    this.isAuthenticated = false;
+    this.authenticated = false;
     this.authenticate();
   }
 
@@ -96,8 +96,8 @@ export class BalanceWebSocket extends BaseGateIOWebSocket {
   /**
    * При закрытии соединения - сбрасываем флаг аутентификации
    */
-  protected onClose(code: number, reason: string): void {
-    this.isAuthenticated = false;
+  protected onClose(_code: number, _reason: string): void {
+    this.authenticated = false;
     this.status = ConnectionStatus.DISCONNECTED;
   }
 
@@ -134,12 +134,12 @@ export class BalanceWebSocket extends BaseGateIOWebSocket {
   private handleAuthResponse(message: any): void {
     if (message.error) {
       logError(`${this.clientName}: Ошибка аутентификации`, new Error(JSON.stringify(message.error)));
-      this.isAuthenticated = false;
+      this.authenticated = false;
       return;
     }
 
     logSuccess(`${this.clientName}: Аутентификация успешна`);
-    this.isAuthenticated = true;
+    this.authenticated = true;
     this.status = ConnectionStatus.AUTHENTICATED;
 
     // После успешной аутентификации - подписываемся на баланс
@@ -210,13 +210,13 @@ export class BalanceWebSocket extends BaseGateIOWebSocket {
    * Проверка, аутентифицирован ли клиент
    */
   public isAuthenticated(): boolean {
-    return this.isAuthenticated && this.isConnected();
+    return this.authenticated && this.isConnected();
   }
 
   /**
    * Переопределяем isConnected для учёта аутентификации
    */
-  public isConnected(): boolean {
+  public override isConnected(): boolean {
     return this.status === ConnectionStatus.AUTHENTICATED;
   }
 }

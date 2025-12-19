@@ -1,4 +1,4 @@
-import { BaseGateIOWebSocket, BaseWebSocketConfig, ConnectionStatus } from './base-ws-client';
+import { BaseGateIOWebSocket } from './base-ws-client';
 import { logInfo, logSuccess } from '../../../core/logger';
 
 export interface OrderBookSnapshot {

@@ -319,15 +319,15 @@ export abstract class BaseGateIOWebSocket {
 
   // ============== ОПЦИОНАЛЬНЫЕ CALLBACKS ==============
 
-  protected onError(error: any): void {
+  protected onError(_error: any): void {
     // Можно переопределить в наследниках
   }
 
-  protected onClose(code: number, reason: string): void {
+  protected onClose(_code: number, _reason: string): void {
     // Можно переопределить в наследниках
   }
 
-  protected onPong(message: any): void {
+  protected onPong(_message: any): void {
     // Можно переопределить в наследниках
   }
 }

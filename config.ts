@@ -1,17 +1,56 @@
 // Базовая конфигурация для всех инстансов dtrader-4
 import * as dotenv from "dotenv";
 import * as path from "path";
+import * as fs from "fs";
 
-const rootEnvPath = path.resolve(__dirname, "../../../.env");
-dotenv.config({ path: rootEnvPath });
+// ВАЖНО: После компиляции __dirname будет указывать на bot/dist/src/config
+// Нужно подняться на 4 уровня: bot/dist/src/config → bot/dist/src → bot/dist → bot → dtrader-4
+
+const isDev = __dirname.includes("/src/config"); // true если запущен через ts-node
+const isCompiled = __dirname.includes("/dist/"); // true если скомпилирован
+
+let rootEnvPath = "";
+
+if (isDev) {
+  // Разработка: bot/src/config → bot → dtrader-4
+  rootEnvPath = path.resolve(__dirname, "../../../.env");
+} else if (isCompiled) {
+  // Production: bot/dist/src/config → bot/dist/src → bot/dist → bot → dtrader-4
+  rootEnvPath = path.resolve(__dirname, "../../../../.env");
+} else {
+  // Fallback
+  rootEnvPath = path.resolve(__dirname, "../../../.env");
+}
 
 console.log("📁 Загрузка конфигурации из:", rootEnvPath);
+console.log(
+  "📂 Файл существует:",
+  fs.existsSync(rootEnvPath) ? "✅ Да" : "❌ Нет"
+);
+
+if (fs.existsSync(rootEnvPath)) {
+  dotenv.config({ path: rootEnvPath });
+} else {
+  console.log("⚠️  .env файл не найден по пути:", rootEnvPath);
+  console.log("📍 __dirname:", __dirname);
+  console.log("📍 isDev:", isDev);
+  console.log("📍 isCompiled:", isCompiled);
+}
+
+// Логируем загрузку конфигурации
+console.log(
+  "🔑 GATEIO_API_KEY:",
+  process.env.GATEIO_API_KEY ? "✅ Настроен" : "❌ Не настроен"
+);
+console.log(
+  "🔑 GATEIO_API_SECRET:",
+  process.env.GATEIO_API_SECRET ? "✅ Настроен" : "❌ Не настроен"
+);
 
 export interface ExchangeConfig {
   apiKey?: string;
   secret?: string;
   enabled: boolean;
-  futuresWsUrl?: string;
 }
 
 export interface RedisConfig {
@@ -24,16 +63,10 @@ export interface WebSocketConfig {
   pingTimeout: number;
 }
 
-export interface TradingPair {
-  symbol: string;
-  base: string;
-  quote: string;
-}
-
 export interface OrderBookConfig {
+  pairs: string[];
   depth: number;
   updateSpeed: string;
-  pairs: TradingPair[];
 }
 
 export interface BaseConfig {
@@ -43,24 +76,7 @@ export interface BaseConfig {
   exchange: ExchangeConfig;
   websocket: WebSocketConfig;
   redis: RedisConfig;
-  orderBook: OrderBookConfig;
-}
-
-function parseTradingPairs(pairsString?: string): TradingPair[] {
-  if (!pairsString) {
-    return [];
-  }
-
-  return pairsString.split(",").map((pair) => {
-    const trimmed = pair.trim();
-    const [base, quote] = trimmed.split("_");
-    
-    return {
-      symbol: trimmed,
-      base: base || "",
-      quote: quote || "",
-    };
-  });
+  orderBook?: OrderBookConfig;
 }
 
 export const baseConfig: BaseConfig = {
@@ -71,7 +87,6 @@ export const baseConfig: BaseConfig = {
     apiKey: process.env.GATEIO_API_KEY,
     secret: process.env.GATEIO_API_SECRET,
     enabled: !!process.env.GATEIO_API_KEY && !!process.env.GATEIO_API_SECRET,
-    futuresWsUrl: process.env.GATEIO_FUTURES_WS_URL || "wss://fx-ws.gateio.ws/v4/ws/usdt",
   },
   websocket: {
     pingInterval: parseInt(process.env.WS_PING_INTERVAL || "15000"),
@@ -82,16 +97,16 @@ export const baseConfig: BaseConfig = {
     port: parseInt(process.env.REDIS_PORT || "6379"),
   },
   orderBook: {
+    pairs: (process.env.ORDERBOOK_PAIRS || "BTC_USDT").split(","),
     depth: parseInt(process.env.ORDERBOOK_DEPTH || "20"),
     updateSpeed: process.env.ORDERBOOK_UPDATE_SPEED || "100ms",
-    pairs: parseTradingPairs(process.env.TRADING_PAIRS),
   },
 };
 
-console.log("🔑 GATEIO_API_KEY:", baseConfig.exchange.apiKey ? "✅ Настроен" : "❌ Не настроен");
-console.log("🔑 GATEIO_API_SECRET:", baseConfig.exchange.secret ? "✅ Настроен" : "❌ Не настроен");
-console.log("📊 Торговые пары:");
-baseConfig.orderBook.pairs.forEach((pair) => {
-  console.log(`   ${pair.symbol} (${pair.base}/${pair.quote})`);
-});
-console.log(`📖 Order Book глубина: ${baseConfig.orderBook.depth}`);
+// Логируем конфигурацию Order Book
+if (baseConfig.orderBook) {
+  console.log("📊 Торговые пары:", baseConfig.orderBook.pairs.join(", "));
+  console.log("📖 Order Book глубина:", baseConfig.orderBook.depth);
+}
+
+console.log("🔐 Exchange enabled:", baseConfig.exchange.enabled);

@@ -8,7 +8,11 @@
     "start": "npm run build && node dist/app.js",
     "start:dev": "nodemon --exec ts-node src/app.ts",
     "build": "tsc",
-    "build:watch": "tsc --watch"
+    "build:watch": "tsc --watch",
+    "test:manual": "npm run build && ./tests/manual/run-all-tests.sh",
+    "test:base": "npm run build && node dist/tests/manual/test-base-ws.js",
+    "test:orderbook": "npm run build && node dist/tests/manual/test-orderbook.js",
+    "test:balance": "npm run build && node dist/tests/manual/test-balance.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
