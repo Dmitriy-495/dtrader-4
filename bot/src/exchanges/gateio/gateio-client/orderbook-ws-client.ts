@@ -1,4 +1,5 @@
-const { WebSocket } = require('ws');
+import { BaseGateIOWebSocket, BaseWebSocketConfig, ConnectionStatus } from './base-ws-client';
+import { logInfo, logSuccess } from '../../../core/logger';
 
 export interface OrderBookSnapshot {
   contract: string;
@@ -19,83 +20,93 @@ export interface BestBidAsk {
 interface OrderBookConfig {
   depth?: number;
   updateSpeed?: string;
-  stateManager?: any;
   onOrderBookUpdate?: (update: OrderBookSnapshot) => void;
   onBestBidAsk?: (data: BestBidAsk) => void;
 }
 
-export class OrderBookWebSocket {
-  private wsUrl: string = 'wss://fx-ws.gateio.ws/v4/ws/usdt';
-  private socket?: any;
-  private connected: boolean = false;
+/**
+ * WebSocket клиент для Order Book Gate.io Futures
+ * Наследуется от BaseGateIOWebSocket
+ */
+export class OrderBookWebSocket extends BaseGateIOWebSocket {
   private depth: number;
   private updateSpeed: string;
   private subscribedPairs: Set<string> = new Set();
   private orderBooks: Map<string, OrderBookSnapshot> = new Map();
   private onOrderBookUpdate?: (update: OrderBookSnapshot) => void;
   private onBestBidAsk?: (data: BestBidAsk) => void;
-  private reconnectAttempts: number = 0;
-  private maxReconnectAttempts: number = 10;
-  private reconnectDelay: number = 1000;
-  private isShuttingDown: boolean = false;
-  private pingInterval?: NodeJS.Timeout;
 
   constructor(config: OrderBookConfig) {
+    // Вызываем конструктор базового класса
+    super({
+      url: 'wss://fx-ws.gateio.ws/v4/ws/usdt',
+      pingInterval: 15000,
+      pingTimeout: 3000,
+      maxReconnectAttempts: 10,
+      reconnectDelay: 1000,
+      name: 'OrderBook-WS'
+    });
+
     this.depth = config.depth || 20;
     this.updateSpeed = config.updateSpeed || '100ms';
     this.onOrderBookUpdate = config.onOrderBookUpdate;
     this.onBestBidAsk = config.onBestBidAsk;
   }
 
-  public connect(): void {
-    if (this.isShuttingDown) {
-      console.log('⚠️  Order Book WS: Завершение работы, подключение отменено');
+  // ============== РЕАЛИЗАЦИЯ ABSTRACT МЕТОДОВ ==============
+
+  /**
+   * Создание ping сообщения для Futures API
+   */
+  protected createPingMessage(): any {
+    return {
+      time: Math.floor(Date.now() / 1000),
+      channel: 'futures.ping'
+    };
+  }
+
+  /**
+   * Проверка pong сообщения
+   */
+  protected isPongMessage(message: any): boolean {
+    return message.event === 'pong' || message.channel === 'futures.pong';
+  }
+
+  /**
+   * При открытии соединения - восстанавливаем подписки
+   */
+  protected onOpen(): void {
+    // Переподписываемся на все пары после переподключения
+    if (this.subscribedPairs.size > 0) {
+      logInfo(`${this.clientName}: Восстановление подписок на ${this.subscribedPairs.size} пар`);
+      this.subscribedPairs.forEach(pair => {
+        this.subscribeToPair(pair);
+      });
+    }
+  }
+
+  /**
+   * Обработка входящих сообщений
+   */
+  protected onMessage(message: any): void {
+    // Обработка подтверждения подписки
+    if (message.channel === 'futures.order_book' && message.event === 'subscribe') {
+      logSuccess(`${this.clientName}: Подписка подтверждена`);
       return;
     }
 
-    console.log('🔄 Order Book WS: Установка соединения...');
-
-    try {
-      this.socket = new WebSocket(this.wsUrl);
-
-      this.socket.on('open', () => {
-        console.log('✅ Order Book WS: Соединение установлено');
-        this.connected = true;
-        this.reconnectAttempts = 0;
-        this.startPingPong();
-      });
-
-      this.socket.on('error', (error: any) => {
-        console.error('❌ Order Book WS: Ошибка:', error);
-        this.handleConnectionError();
-      });
-
-      this.socket.on('close', () => {
-        console.log('🔌 Order Book WS: Соединение закрыто');
-        this.handleConnectionClose();
-      });
-
-      this.socket.on('message', (data: any) => {
-        this.handleMessage(data);
-      });
-    } catch (error) {
-      console.error('❌ Order Book WS: Ошибка создания соединения:', error);
-      this.handleConnectionError();
+    // Обработка обновления order book
+    if (message.event === 'update' && message.channel === 'futures.order_book') {
+      this.processOrderBookUpdate(message);
+      return;
     }
   }
 
-  private handleMessage(data: any): void {
-    try {
-      const message = JSON.parse(data);
+  // ============== ЛОГИКА ORDER BOOK ==============
 
-      if (message.event === 'update' && message.channel === 'futures.order_book') {
-        this.processOrderBookUpdate(message);
-      }
-    } catch (error) {
-      console.error('❌ Order Book WS: Ошибка обработки сообщения:', error);
-    }
-  }
-
+  /**
+   * Обработка обновления order book
+   */
   private processOrderBookUpdate(message: any): void {
     const contract = message.result?.contract;
     if (!contract) return;
@@ -107,15 +118,21 @@ export class OrderBookWebSocket {
       timestamp: Date.now()
     };
 
+    // Сохраняем snapshot
     this.orderBooks.set(contract, snapshot);
 
+    // Вызываем callback
     if (this.onOrderBookUpdate) {
       this.onOrderBookUpdate(snapshot);
     }
 
+    // Рассчитываем и отправляем best bid/ask
     this.calculateBestBidAsk(snapshot);
   }
 
+  /**
+   * Расчёт best bid/ask и spread
+   */
   private calculateBestBidAsk(snapshot: OrderBookSnapshot): void {
     const bestBid = snapshot.bids.length > 0 ? {
       price: snapshot.bids[0][0],
@@ -151,9 +168,14 @@ export class OrderBookWebSocket {
     }
   }
 
+  // ============== ПУБЛИЧНЫЕ МЕТОДЫ ==============
+
+  /**
+   * Подписка на order book пары
+   */
   public subscribeToPair(pair: string): void {
-    if (!this.socket || !this.connected) {
-      console.log('⚠️  Order Book WS: Не подключен, отложенная подписка');
+    if (!this.isConnected()) {
+      logInfo(`${this.clientName}: Не подключен, отложенная подписка на ${pair}`);
       this.subscribedPairs.add(pair);
       return;
     }
@@ -165,14 +187,18 @@ export class OrderBookWebSocket {
       payload: [pair, this.depth.toString(), this.updateSpeed]
     };
 
-    this.socket.send(JSON.stringify(subscribeMessage));
+    this.sendMessage(subscribeMessage);
     this.subscribedPairs.add(pair);
-    console.log(`📡 Order Book WS: Подписка на ${pair}`);
+    logInfo(`${this.clientName}: Подписка на ${pair}`);
   }
 
+  /**
+   * Отписка от order book пары
+   */
   public unsubscribeFromPair(pair: string): void {
-    if (!this.socket || !this.connected) {
+    if (!this.isConnected()) {
       this.subscribedPairs.delete(pair);
+      this.orderBooks.delete(pair);
       return;
     }
 
@@ -183,16 +209,22 @@ export class OrderBookWebSocket {
       payload: [pair]
     };
 
-    this.socket.send(JSON.stringify(unsubscribeMessage));
+    this.sendMessage(unsubscribeMessage);
     this.subscribedPairs.delete(pair);
     this.orderBooks.delete(pair);
-    console.log(`📡 Order Book WS: Отписка от ${pair}`);
+    logInfo(`${this.clientName}: Отписка от ${pair}`);
   }
 
+  /**
+   * Получить snapshot order book
+   */
   public getOrderBook(pair: string): OrderBookSnapshot | null {
     return this.orderBooks.get(pair) || null;
   }
 
+  /**
+   * Получить best bid/ask
+   */
   public getBestBidAsk(pair: string): BestBidAsk | null {
     const snapshot = this.orderBooks.get(pair);
     if (!snapshot) return null;
@@ -227,86 +259,10 @@ export class OrderBookWebSocket {
     };
   }
 
+  /**
+   * Получить список подписанных пар
+   */
   public getSubscribedPairs(): string[] {
     return Array.from(this.subscribedPairs);
-  }
-
-  private startPingPong(): void {
-    this.pingInterval = setInterval(() => {
-      if (this.socket && this.connected) {
-        const pingMessage = {
-          time: Math.floor(Date.now() / 1000),
-          channel: 'futures.ping'
-        };
-
-        try {
-          this.socket.send(JSON.stringify(pingMessage));
-        } catch (error) {
-          console.error('❌ Order Book WS: Ошибка ping:', error);
-        }
-      }
-    }, 15000);
-  }
-
-  private stopPingPong(): void {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = undefined;
-    }
-  }
-
-  private handleConnectionError(): void {
-    if (this.isShuttingDown) return;
-
-    this.connected = false;
-    this.stopPingPong();
-
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error(`❌ Order Book WS: Превышено максимальное количество попыток`);
-      return;
-    }
-
-    this.reconnectAttempts++;
-    const delay = Math.min(
-      this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
-      60000
-    );
-
-    console.log(`🔄 Order Book WS: Переподключение ${this.reconnectAttempts}/${this.maxReconnectAttempts} через ${delay}ms`);
-
-    setTimeout(() => {
-      this.connect();
-    }, delay);
-  }
-
-  private handleConnectionClose(): void {
-    if (this.isShuttingDown) {
-      console.log('✅ Order Book WS: Соединение закрыто (нормальное завершение)');
-      return;
-    }
-
-    this.connected = false;
-    this.stopPingPong();
-    this.handleConnectionError();
-  }
-
-  public disconnect(): void {
-    this.isShuttingDown = true;
-    this.stopPingPong();
-
-    if (this.socket) {
-      try {
-        this.socket.close();
-        console.log('🔌 Order Book WS: Соединение закрыто');
-      } catch (error) {
-        console.error('❌ Order Book WS: Ошибка закрытия:', error);
-      }
-    }
-
-    this.connected = false;
-  }
-
-  public isConnected(): boolean {
-    return this.connected;
   }
 }

@@ -1,25 +1,24 @@
 import { getStateManager, BalanceState } from "../core/StateManager";
 import { logInfo, logSuccess, logError, logWarning } from "../core/logger";
-import { GateioWebSocket } from "../exchanges/gateio/gateio-client/ws-client";
 import { OrderBookWebSocket, OrderBookSnapshot, BestBidAsk } from "../exchanges/gateio/gateio-client/orderbook-ws-client";
+import { BalanceWebSocket } from "../exchanges/gateio/gateio-client/balance-ws-client";
 import { GateIOBalance } from "../exchanges/gateio/endpoints/getBalance";
 import { baseConfig as config } from "../config/config";
 
 interface InstanceHealth {
   stateManager: boolean;
-  websocket: boolean;
   exchange: boolean;
   orderBook: boolean;
+  balanceWs: boolean;
   lastBalanceUpdate: number;
 }
 
 export class InstanceSystem {
   private stateManager: ReturnType<typeof getStateManager>;
   private isRunning: boolean;
-  private wsClient?: GateioWebSocket;
   private orderBookWs?: OrderBookWebSocket;
+  private balanceWs?: BalanceWebSocket;
   private gateioClient?: GateIOBalance;
-  private balanceUpdateInterval?: NodeJS.Timeout;
   private healthCheckInterval?: NodeJS.Timeout;
   private health: InstanceHealth;
 
@@ -28,9 +27,9 @@ export class InstanceSystem {
     this.isRunning = false;
     this.health = {
       stateManager: false,
-      websocket: false,
       exchange: false,
       orderBook: false,
+      balanceWs: false,
       lastBalanceUpdate: 0,
     };
 
@@ -73,17 +72,6 @@ export class InstanceSystem {
         }
       }
 
-      // Инициализируем WebSocket
-      this.wsClient = new GateioWebSocket({
-        pingInterval: 15000,
-        pingTimeout: 3000,
-        stateManager: this.stateManager,
-        maxReconnectAttempts: 10,
-        reconnectDelay: 1000,
-      });
-      this.wsClient.connect();
-      this.health.websocket = true;
-
       // Инициализируем Order Book WebSocket
       if (config.orderBook && config.orderBook.pairs.length > 0) {
         logInfo("Инициализация Order Book WebSocket...");
@@ -91,7 +79,6 @@ export class InstanceSystem {
         this.orderBookWs = new OrderBookWebSocket({
           depth: config.orderBook.depth || 20,
           updateSpeed: config.orderBook.updateSpeed || '100ms',
-          stateManager: this.stateManager,
           onOrderBookUpdate: (update: any) => {
             logInfo(`Order Book update: ${update.contract}`);
           },
@@ -105,8 +92,25 @@ export class InstanceSystem {
         logSuccess("Order Book WebSocket инициализирован");
       }
 
-      // Запускаем периодическое обновление баланса
-      this.startBalanceUpdates();
+      // Инициализируем Balance WebSocket вместо REST polling
+      if (config.exchange.enabled) {
+        logInfo("Инициализация Balance WebSocket...");
+        
+        this.balanceWs = new BalanceWebSocket({
+          apiKey: config.exchange.apiKey!,
+          apiSecret: config.exchange.secret!,
+          onBalanceUpdate: async (balances) => {
+            // Сохраняем в Redis при получении обновления
+            await this.stateManager.setCurrentBalance(balances);
+            this.health.lastBalanceUpdate = Date.now();
+            logInfo(`💰 Баланс обновлен: ${balances.length} валют`);
+          }
+        });
+        
+        this.balanceWs.connect();
+        this.health.balanceWs = true;
+        logSuccess("Balance WebSocket инициализирован");
+      }
 
       // Запускаем health check
       this.startHealthCheck();
@@ -121,23 +125,6 @@ export class InstanceSystem {
     }
   }
 
-  private startBalanceUpdates() {
-    if (!this.gateioClient) return;
-
-    this.balanceUpdateInterval = setInterval(async () => {
-      try {
-        const balance = await this.getCurrentBalance();
-        if (balance) {
-          this.health.lastBalanceUpdate = Date.now();
-        }
-      } catch (error) {
-        logError("Ошибка периодического обновления баланса", error);
-      }
-    }, 30000);
-
-    logInfo("Периодическое обновление баланса запущено (каждые 30 секунд)");
-  }
-
   private startHealthCheck() {
     this.healthCheckInterval = setInterval(() => {
       const health = this.getHealth();
@@ -146,12 +133,12 @@ export class InstanceSystem {
         logError("Health Check: StateManager неисправен", new Error("Redis connection lost"));
       }
 
-      if (!health.websocket) {
-        logWarning("Health Check: WebSocket не подключен");
-      }
-
       if (!health.exchange) {
         logWarning("Health Check: Gate.io API недоступен");
+      }
+      
+      if (!health.balanceWs && config.exchange.enabled) {
+        logWarning("Health Check: Balance WebSocket не подключен");
       }
       
       if (!health.orderBook && config.orderBook?.pairs.length > 0) {
@@ -159,7 +146,7 @@ export class InstanceSystem {
       }
 
       const timeSinceLastUpdate = Date.now() - health.lastBalanceUpdate;
-      if (timeSinceLastUpdate > 60000) {
+      if (timeSinceLastUpdate > 60000 && config.exchange.enabled) {
         logWarning(`Health Check: Баланс не обновлялся ${Math.floor(timeSinceLastUpdate / 1000)}с`);
       }
     }, 60000);
@@ -176,20 +163,16 @@ export class InstanceSystem {
 
       logInfo("Остановка Instance System для bot инстанса...");
 
-      if (this.balanceUpdateInterval) {
-        clearInterval(this.balanceUpdateInterval);
-      }
-
       if (this.healthCheckInterval) {
         clearInterval(this.healthCheckInterval);
       }
 
-      if (this.wsClient && this.wsClient.isConnected()) {
-        this.wsClient.disconnect();
-      }
-      
       if (this.orderBookWs && this.orderBookWs.isConnected()) {
         this.orderBookWs.disconnect();
+      }
+      
+      if (this.balanceWs && this.balanceWs.isConnected()) {
+        this.balanceWs.disconnect();
       }
 
       await this.stateManager.disconnect();
@@ -197,9 +180,9 @@ export class InstanceSystem {
       this.isRunning = false;
       this.health = {
         stateManager: false,
-        websocket: false,
         exchange: false,
         orderBook: false,
+        balanceWs: false,
         lastBalanceUpdate: 0,
       };
 
@@ -223,18 +206,26 @@ export class InstanceSystem {
   getHealth(): InstanceHealth {
     return {
       stateManager: this.stateManager.isHealthy(),
-      websocket: this.wsClient?.isConnected() || false,
       exchange: this.health.exchange,
       orderBook: this.orderBookWs?.isConnected() || false,
+      balanceWs: this.balanceWs?.isConnected() || false,
       lastBalanceUpdate: this.health.lastBalanceUpdate,
     };
   }
 
   async getCurrentBalance(): Promise<BalanceState[] | null> {
     try {
+      // Сначала пытаемся получить из Redis (там данные от WebSocket)
+      const cachedBalance = await this.stateManager.getCurrentBalance();
+      
+      if (cachedBalance && cachedBalance.length > 0) {
+        return cachedBalance;
+      }
+
+      // Fallback на REST API если нет данных в Redis
       if (!this.gateioClient) {
         logWarning("Gate.io клиент не инициализирован");
-        return await this.stateManager.getCurrentBalance();
+        return null;
       }
 
       const response = await this.gateioClient.getSpotBalance();
@@ -245,7 +236,7 @@ export class InstanceSystem {
         return response.data;
       }
 
-      return await this.stateManager.getCurrentBalance();
+      return null;
     } catch (error) {
       logError("Ошибка получения текущего баланса", error);
       return null;
